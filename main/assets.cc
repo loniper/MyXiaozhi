@@ -375,13 +375,10 @@ bool Assets::LvglStrategy::Apply(Assets* assets, bool refresh_display_theme) {
                     LvglTheme::ParseColor(background_color->valuestring));
             }
             if (cJSON_IsString(background_image)) {
-                if (!assets->GetAssetData(background_image->valuestring, ptr, size)) {
-                    ESP_LOGE(TAG, "The background image file %s is not found",
-                             background_image->valuestring);
-                    return false;
-                }
-                auto background_image = std::make_shared<LvglCBinImage>(ptr);
-                light_theme->set_background_image(background_image);
+                // 谷仓次元屏 GrokBot 版：皮肤底图（原厂蓝色渐变/水印）一律不加载。
+                // 形象是整屏自绘的纯黑底，任何底图都只会在开机阶段露出来闪一下。
+                ESP_LOGI(TAG, "Skin background image '%s' ignored (GrokBot uses a black stage)",
+                         background_image->valuestring);
             }
         }
         cJSON* dark_skin = cJSON_GetObjectItem(skin, "dark");
@@ -399,13 +396,9 @@ bool Assets::LvglStrategy::Apply(Assets* assets, bool refresh_display_theme) {
                     LvglTheme::ParseColor(background_color->valuestring));
             }
             if (cJSON_IsString(background_image)) {
-                if (!assets->GetAssetData(background_image->valuestring, ptr, size)) {
-                    ESP_LOGE(TAG, "The background image file %s is not found",
-                             background_image->valuestring);
-                    return false;
-                }
-                auto background_image = std::make_shared<LvglCBinImage>(ptr);
-                dark_theme->set_background_image(background_image);
+                // 同上：暗色皮肤的底图也不加载。
+                ESP_LOGI(TAG, "Dark skin background image '%s' ignored (GrokBot uses a black stage)",
+                         background_image->valuestring);
             }
         }
     }

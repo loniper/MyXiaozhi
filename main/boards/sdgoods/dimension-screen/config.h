@@ -54,8 +54,20 @@
 #define QSPI_PIN_NUM_LCD_DATA2  GPIO_NUM_42
 #define QSPI_PIN_NUM_LCD_DATA3  GPIO_NUM_41
 #define QSPI_PIN_NUM_LCD_RST    DISPLAY_RST_GPIO
+// 面板 TE（帧起始）输出，来自参考 BSP board_pins.h: BOARD_LCD_SPI_IO_TE = 18。
+// 用来把整屏 GRAM 写入对齐到面板扫描起点，消除换肤整屏滑动时的撕裂/斜向错位。
+#define QSPI_PIN_NUM_LCD_TE     GPIO_NUM_18
 
 #define DISPLAY_SPI_PCLK_HZ   (80 * 1000 * 1000)
+
+// QSPI 单事务上限：LVGL 绘制缓冲放在 PSRAM 时，spi_master 无法让 DMA 直接读 PSRAM，
+// 每个在途事务都要 malloc 一块同等大小的内部 DMA 弹跳缓冲并 memcpy。
+// 4092B = 1 个 DMA 描述符；配合 2 个在途事务只需约 8KB 内部 DMA，才能分配成功。
+// （若沿用 57KB 单事务，两个在途要 115KB 内部 DMA，必然 setup_dma_priv_buffer 失败，
+//   flush 卡死，屏上就是成片花屏/条纹。）
+#define DISPLAY_SPI_MAX_TRANSFER_SZ   4092
+// 在途事务数：与上面的分块配合，内部 DMA 弹跳缓冲总量约 2 * 4096B
+#define DISPLAY_SPI_TRANS_QUEUE_DEPTH 2
 
 // ============ 音频（无 codec 芯片：数字麦 + I2S 功放）============
 #define AUDIO_INPUT_SAMPLE_RATE   16000

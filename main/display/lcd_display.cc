@@ -9,6 +9,12 @@
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
+#include <esp_memory_utils.h>
+#include <soc/soc_caps.h>
+#if CONFIG_SPIRAM && SOC_CACHE_WRITEBACK_SUPPORTED
+#include <esp_cache.h>
+#endif
+#include <sdkconfig.h>
 #include <material_symbols.h>
 #include <noto_emoji.h>
 #include <src/misc/cache/lv_cache.h>
@@ -97,6 +103,55 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     esp_timer_create(&preview_timer_args, &preview_timer_);
 }
 
+static bool (*s_flush_sync_hook)(uint32_t timeout_ms) = nullptr;
+
+void SpiLcdDisplay::SetFlushSyncHook(bool (*fn)(uint32_t timeout_ms)) {
+    s_flush_sync_hook = fn;
+}
+
+static void sdgoods_spi_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *px_map) {
+    esp_lcd_panel_handle_t panel = static_cast<esp_lcd_panel_handle_t>(lv_display_get_user_data(drv));
+    const uint32_t px = lv_area_get_size(area);
+    if (px == 0 || panel == nullptr) {
+        lv_display_flush_ready(drv);
+        return;
+    }
+
+    // ===== 换肤/CC 残留（底纹、斜向重影）的真正根因 =====
+    // S3 的 PSRAM 走 CPU 写回缓存（write-back）：LVGL 把新帧画进 PSRAM 缓冲后，像素可能
+    // 还滞留在 cache 里、尚未落到物理 PSRAM。此时 DMA 若直接去 PSRAM 取数（或经 internal
+    // 弹跳缓冲拷贝），读到的就是上一帧的陈旧数据 —— 一屏里同时出现新/旧两帧，在手机
+    // 卷帘快门里就是「斜向残留」。参考工程 sdgoods_lvgl.c 在每次 flush 前都做一次
+    // cache write-back（clean），这里之前漏掉了。对局部小刷新同样生效：不清干净，
+    // 时钟/状态字在快速切换时也会偶尔闪旧值。
+#if CONFIG_SPIRAM && SOC_CACHE_WRITEBACK_SUPPORTED
+    if (esp_ptr_external_ram(px_map)) {
+        const size_t bytes = (size_t)px * 2;  /* RGB565_SWAPPED，每像素 2 字节 */
+        esp_cache_msync(px_map, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
+#endif
+
+    // 不再在这里做 lv_draw_sw_rgb565_swap：显示格式已经设成 RGB565_SWAPPED，
+    // LVGL 渲染时直接按大端写入，逐像素交换在绘制阶段就完成了。
+    // esp_lcd_panel_draw_bitmap 内部把分块事务排进 DMA 队列；传输完成由 panel IO 的
+    // on_color_trans_done 回调 lv_display_flush_ready。所以这里返回并不代表已上屏。
+    // 参考工程遇到「内部 DMA 弹跳缓冲暂满」（ESP_ERR_NO_MEM）会稍等再重试，而不是直接
+    // 丢帧 —— 丢这一整帧正是黑带/残留的直接来源之一。
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 12; ++i) {
+        err = esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1,
+                                        area->y2 + 1, px_map);
+        if (err == ESP_OK) return;   /* 提交成功：DMA 完成回调会调 flush_ready */
+        if (err == ESP_ERR_NO_MEM) {
+            vTaskDelay(pdMS_TO_TICKS(5));   /* 队列/描述符暂满，让 DMA 跑完腾资源再试 */
+            continue;
+        }
+        break;
+    }
+    ESP_LOGE(TAG, "draw_bitmap failed: %s, frame dropped", esp_err_to_name(err));
+    lv_display_flush_ready(drv);
+}
+
 SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                              int width, int height, int offset_x, int offset_y, bool mirror_x,
                              bool mirror_y, bool swap_xy, bool fullscreen_psram_buf)
@@ -163,7 +218,10 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
 
     ESP_LOGI(TAG, "Initialize LVGL port");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    port_cfg.task_priority = 1;
+    // 原厂 sdgoods_lvgl.c：LVGL 任务优先级 5，音频/解码任务 6。
+    // 这里曾是 1，导致电台播放时 LVGL 被音频任务持续抢占，
+    // 表现为整机卡顿、点按丢失（LVGL 读不到完整的按下/抬起样本）。
+    port_cfg.task_priority = 5;
     port_cfg.timer_period_ms = 2;  // 与原厂 sdgoods_lvgl.c 对齐：LVGL tick 2ms（默认 5ms 动画显断）
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
@@ -171,18 +229,26 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
-    // fullscreen_psram_buf（本板开启，对齐原厂 sdgoods_lvgl.c 主力方案）：
-    // 全屏尺寸 PSRAM 双缓冲 + PARTIAL 渲染——脏区一次 flush 盖整块无效区，渲染与 DMA 重叠；
-    // 而旧版 20 行单缓冲内部 SRAM 整屏重绘要 18 次同步 flush，满屏动画/滑条拖动明显卡顿。
-    // 其它板子默认 false 维持原行为不受影响。
-    const uint32_t buf_pixels = fullscreen_psram_buf ? static_cast<uint32_t>(width_ * height_)
-                                                     : static_cast<uint32_t>(width_ * 20);
-    const lvgl_port_display_cfg_t display_cfg = {
+    // ===== 屏上「多帧内容斜向交错」的真正根因在这里 =====
+    // PARTIAL 模式下 LVGL 按绘制缓冲的“高度”把一次失效区域切成若干条 flush：
+    // 缓冲只有 20 行时，一整屏（360x360）会被切成 18 条 360x20，每条都单独一次
+    // CASET/RASET + RAMWR，而且都是异步排队的。换肤/封面整屏滑动时每一帧内容都在变，
+    // 这 18 条跨越了不止一个面板刷新周期，面板扫描时看到的就是「相邻几帧的条带拼接」
+    // ——同一段文字出现在两三个不同位置、边界呈斜向锯齿。双缓冲只能保证不写坏内存，
+    // 不能消除条带之间的时间差。
+    // 修法：绘制缓冲做成整屏大小（360x360）。PARTIAL + 整屏缓冲下，整屏失效区域只会
+    // 渲染一次、flush 一次（一次 CASET/RASET + 一整条连续 RAMWR 流），面板一帧只被
+    // 改写一遍，帧与帧之间的接缝回到“最多一条极细的推进线”（与参考工程一致）。
+    // 259KB x2 只能放 PSRAM；spi_master 用每事务 4KB 的内部 DMA 弹跳缓冲转发
+    // （分块 4092B / 2 在途见板级 config.h），内部 DMA 只需 ~8KB。
+    const uint32_t full_px = static_cast<uint32_t>(width_ * height_);
+    const uint32_t buf_pixels = fullscreen_psram_buf ? full_px : static_cast<uint32_t>(width_ * 20);
+    lvgl_port_display_cfg_t display_cfg = {
         .io_handle = panel_io_,
         .panel_handle = panel_,
         .control_handle = nullptr,
         .buffer_size = buf_pixels,
-        .double_buffer = fullscreen_psram_buf,
+        .double_buffer = true,  // 上一帧还在 DMA 时，下一帧可以渲染进另一块缓冲
         .trans_size = 0,
         .hres = static_cast<uint32_t>(width_),
         .vres = static_cast<uint32_t>(height_),
@@ -199,21 +265,49 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
                 .buff_dma = static_cast<unsigned>(fullscreen_psram_buf ? 0 : 1),
                 .buff_spiram = static_cast<unsigned>(fullscreen_psram_buf ? 1 : 0),
                 .sw_rotate = 0,
-                .swap_bytes = 1,
+                .swap_bytes = 0,  // 已改用 RGB565_SWAPPED 显示格式，flush 里不再交换
+                // 保持 PARTIAL：静态界面（时钟、电平）只刷脏区，不必每帧重画整屏；
+                // 整屏动画时失效区域本身就是整屏，配合整屏缓冲自然只有一次 flush。
                 .full_refresh = 0,
                 .direct_mode = 0,
             },
     };
 
     display_ = lvgl_port_add_disp(&display_cfg);
+    if (display_ == nullptr && fullscreen_psram_buf) {
+        // PSRAM 双缓冲不够时先退回「单块整屏 PSRAM 缓冲」：仍然是一整屏只 flush 一次，
+        // 只是渲染要等上一次 SPI 传完，帧率略低；效果远好于退回 20 行条带缓冲。
+        ESP_LOGW(TAG, "full-frame double buffer unavailable, fallback to single full-frame buffer");
+        display_cfg.double_buffer = false;
+        display_ = lvgl_port_add_disp(&display_cfg);
+    }
+    if (display_ == nullptr && fullscreen_psram_buf) {
+        // 最后才退回 20 行内部 SRAM 缓冲：能显示，但整屏动画会多帧交错。
+        ESP_LOGW(TAG, "full-frame PSRAM buffer unavailable, fallback to internal 20-line buffer");
+        display_cfg.buffer_size = static_cast<uint32_t>(width_ * 20);
+        display_cfg.double_buffer = true;
+        display_cfg.flags.buff_dma = 1;
+        display_cfg.flags.buff_spiram = 0;
+        display_ = lvgl_port_add_disp(&display_cfg);
+    }
     if (display_ == nullptr) {
         ESP_LOGE(TAG, "Failed to add display");
         return;
     }
 
+    // 接管 flush：面板 IO 的完成回调负责 flush_ready，失败路径由我们自己兜底，
+    // 避免一次排队失败就把整个 LVGL 刷新永久卡住。
+    // 同时把显示格式切成 RGB565_SWAPPED：LVGL 渲染时直接写成 ST77916 要的大端序，
+    // flush 里省掉一次整屏 259KB 的 lv_draw_sw_rgb565_swap（PSRAM 上读+写约 518KB，
+    // 实测 8~12ms/帧，动画期间直接吃掉半个刷新周期，是画面「不平整」的主要原因）。
+    lvgl_port_lock(0);
+    lv_display_set_color_format(display_, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_user_data(display_, panel_);
+    lv_display_set_flush_cb(display_, sdgoods_spi_flush_cb);
     if (offset_x != 0 || offset_y != 0) {
         lv_display_set_offset(display_, offset_x, offset_y);
     }
+    lvgl_port_unlock();
 }
 
 // RGB LCD implementation

@@ -108,6 +108,14 @@ public:
      */
     void StopListening();
 
+    /**
+     * App framework gate: while an app owns the screen the assistant ends its
+     * current conversation and ignores the wake word. Clearing the gate returns
+     * to the desktop. State machine changes are queued to the main task.
+     */
+    void SetInteractionSuppressed(bool suppressed);
+    bool IsInteractionSuppressed() const { return interaction_suppressed_; }
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -151,6 +159,7 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    bool interaction_suppressed_ = false;   // An app owns the screen: no wake word, no conversation
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

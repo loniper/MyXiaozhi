@@ -22,13 +22,28 @@ public:
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
 
+    // Raw PCM streaming for the radio app: reconfigures the speaker I2S clock
+    // to the decoded rate and writes interleaved int16 PCM (mono or stereo).
+    esp_err_t StartStream(int sample_rate, int channels);
+    esp_err_t WriteStream(const int16_t* pcm, size_t bytes);
+    void StopStream();
+
 protected:
     virtual int Write(const int16_t* data, int samples) override;
     virtual int Read(int16_t* dest, int samples) override;
 
 private:
+    /* 麦克风与喇叭是两个独立的 I2S 通道（i2s_new_channel 各建一个），
+     * 必须用各自的锁：Read() 会阻塞最多 200ms 等麦克风数据，若与写喇叭共用
+     * 一把锁，电台每次写 I2S 都可能被挡住 几十~200ms，远超 DMA 垫底时长，
+     * 听感就是周期性“卡一下/掉一小段”。 */
     std::mutex data_if_mutex_;
+    std::mutex rx_mutex_;
     gpio_num_t pa_gpio_;
+    int stream_channels_ = 1;
+    int stream_rate_ = 0;
+    bool streaming_ = false;
+    std::vector<int16_t> stream_buf_;
 };
 
 #endif // _SDGOODS_AUDIO_CODEC_H

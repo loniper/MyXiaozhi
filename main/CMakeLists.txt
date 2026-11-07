@@ -40,10 +40,37 @@ set(SOURCES "audio/audio_codec.cc"
             "settings.cc"
             "device_state_machine.cc"
             "assets.cc"
+            "apps/app_center.cc"
+            "apps/app_host.cc"
+            "apps/app_icons.cc"
+            "apps/apps_manifest.cc"
+            "apps/demo_app.cc"
+            "apps/device_info_app.cc"
+            "apps/radio/radio_app.cc"
+            "apps/radio/radio_catalog.c"
+            "apps/radio/radio_font_16.c"
+            "apps/radio/radio_player.c"
+            "apps/radio/radio_title_24.c"
+            "apps/radio/radio_title_28.c"
+            "apps/radio/radio_title_32.c"
+            "apps/radio/radio_settings.c"
+            "apps/radio/radio_station_identity.c"
+            "apps/radio/sdgoods_app_shell.c"
+            "apps/radio/sdgoods_audio_shim.cc"
+            "apps/radio/sdgoods_cc.c"
+            "apps/radio/sdgoods_i18n.c"
+            "apps/radio/sdgoods_tap.c"
+            "apps/radio/ui_radio.c"
+            "apps/radio/ui_radio_assets.c"
+            "apps/radio/ui_radio_kit.c"
+            "apps/radio/ui_radio_pages.c"
+            "apps/radio/ui_radio_redraw_assets.c"
+            "apps/radio/ui_radio_skin.c"
+            "apps/radio/wifi_prov_shim.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "apps" "apps/radio")
 
 # Add board common files
 list(APPEND SOURCES
@@ -1107,6 +1134,9 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         xiaozhi-fonts
+                        esp_http_client
+                        espressif__cjson
+                        espressif__esp_audio_codec
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

@@ -6,15 +6,22 @@
 #include "wifi_board.h"
 #include "sdgoods_audio_codec.h"
 #include "display/lcd_display.h"
+#include "display/lvgl_display/lvgl_theme.h"
 #include "application.h"
+#include "apps/app_host.h"
+#include "apps/radio/ui_radio.h"
 #include "button.h"
 #include "adc_battery_monitor.h"
 #include "system_info.h"
 #include "mcp_server.h"
 #include "config.h"
+#include "grokbot_avatar.h"
+#include "assets/lang_config.h"
 
 #include <esp_log.h>
 #include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <driver/i2c_master.h>
 #include <esp_adc/adc_oneshot.h>  // adc_unit_t / ADC_CHANNEL_7（新 esp_adc 头，避免 legacy driver/adc.h 弃用警告）
 #include <esp_lcd_panel_io.h>
@@ -29,7 +36,11 @@
 #include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
+#include <cctype>
+#include <cstring>
 #include <lvgl.h>
 
 #define TAG "sdgoods_dimension_screen"
@@ -49,51 +60,412 @@ public:
     // SetupUI 完成后回调（板级用来挂控制中心浮层：必须在容器建好之后再叠在上层）
     std::function<void()> on_setup_done;
 
-    virtual void SetupUI() override {
-        SpiLcdDisplay::SetupUI();
-        DisplayLockGuard lock(this);
-        // 顶部状态栏（y≈0..32，弦宽≈205）：图标内收
-        if (top_bar_ != nullptr) {
-            lv_obj_set_style_pad_left(top_bar_, 72, 0);
-            lv_obj_set_style_pad_right(top_bar_, 72, 0);
+    // GrokBot 版小智：待机/聆听/思考/说话只显示形象与一枚顶部状态点，不显示任何文字；
+    // 配网与联网阶段保留顶部提示（纯白文字、无底框）。
+    enum class Phase { None, Listening, Thinking, Speaking };
+
+    bool IsProvisioningStatus(const char* status) {
+        return strcmp(status, Lang::Strings::WIFI_CONFIG_MODE) == 0 ||
+               strcmp(status, Lang::Strings::SCANNING_WIFI) == 0 ||
+               strcmp(status, Lang::Strings::ENTERING_WIFI_CONFIG_MODE) == 0;
+    }
+    void HideTopText() {
+        if (grok_text_ != nullptr) {
+            lv_label_set_text(grok_text_, "");
+            lv_obj_add_flag(grok_text_, LV_OBJ_FLAG_HIDDEN);
         }
         if (status_label_ != nullptr) {
-            lv_obj_set_width(status_label_, 190);
+            lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
         }
         if (notification_label_ != nullptr) {
-            lv_obj_set_width(notification_label_, 190);
+            lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    void ShowTopText(const char* text) {
+        if (grok_text_ == nullptr || text == nullptr || text[0] == '\0') {
+            return;
+        }
+        lv_label_set_text(grok_text_, text);
+        lv_obj_remove_flag(grok_text_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(grok_text_);
+    }
+
+    // 顶部状态点：绿=聆听，黄=思考，白=说话。只在交互阶段出现。
+    void SetDot(uint32_t color_hex, bool show) {
+        if (grok_dot_ == nullptr) {
+            return;
+        }
+        if (!show) {
+            lv_obj_add_flag(grok_dot_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        lv_color_t c = lv_color_hex(color_hex);
+        lv_obj_set_style_bg_color(grok_dot_, c, 0);
+        lv_obj_set_style_shadow_color(grok_dot_, c, 0);
+        lv_obj_remove_flag(grok_dot_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(grok_dot_);
+    }
+
+    static bool IsClockString(const char* s) {
+        // 状态栏待机时会推送 "HH:MM" 时钟；此版本待机不显示任何文字。
+        return s != nullptr && strlen(s) == 5 && s[2] == ':' && isdigit(static_cast<unsigned char>(s[0])) &&
+               isdigit(static_cast<unsigned char>(s[1])) && isdigit(static_cast<unsigned char>(s[3])) &&
+               isdigit(static_cast<unsigned char>(s[4]));
+    }
+
+    virtual void SetStatus(const char* status) override {
+        if (status == nullptr || IsClockString(status) || app_mode_) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        if (strcmp(status, Lang::Strings::LISTENING) == 0) {
+            silent_phase_ = true;
+            phase_ = Phase::Listening;
+            HideTopText();
+            if (grok_avatar_ != nullptr) {
+                grok_avatar_->SetMode(GrokbotAvatar::Mode::Listening);
+            }
+            SetDot(0x35D07A, true);
+            return;
+        }
+        if (strcmp(status, Lang::Strings::CONNECTING) == 0) {
+            // 开音频通道 / 等待回复：思考阶段。
+            silent_phase_ = true;
+            phase_ = Phase::Thinking;
+            HideTopText();
+            if (grok_avatar_ != nullptr) {
+                grok_avatar_->SetMode(GrokbotAvatar::Mode::Other);
+                grok_avatar_->SetEmotion("thinking");
+            }
+            SetDot(0xFFC53D, true);
+            return;
+        }
+        if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+            silent_phase_ = true;
+            phase_ = Phase::Speaking;
+            HideTopText();
+            if (grok_avatar_ != nullptr) {
+                grok_avatar_->SetMode(GrokbotAvatar::Mode::Speaking);
+            }
+            SetDot(0xFFFFFF, true);
+            return;
+        }
+        if (strcmp(status, Lang::Strings::STANDBY) == 0) {
+            // 说完话到回复开始之间会先回到 Idle：按待机处理，不显示状态点。
+            // （黄点只在 Connecting 阶段出现。）
+            silent_phase_ = true;
+            phase_ = Phase::None;
+            HideTopText();
+            if (grok_avatar_ != nullptr) {
+                grok_avatar_->SetMode(GrokbotAvatar::Mode::Standby);
+            }
+            SetDot(0, false);
+            return;
+        }
+        phase_ = Phase::None;
+        silent_phase_ = false;
+        SetDot(0, false);
+        if (grok_avatar_ != nullptr) {
+            grok_avatar_->SetMode(IsProvisioningStatus(status) ? GrokbotAvatar::Mode::Provisioning
+                                                              : GrokbotAvatar::Mode::Other);
+        }
+        ShowTopText(status);
+    }
+
+    virtual void ShowNotification(const char* notification, int duration_ms = 3000) override {
+        (void)duration_ms;
+        if (silent_phase_ || notification == nullptr || app_mode_) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        ShowTopText(notification);
+    }
+    virtual void ShowNotification(const std::string& notification,
+                                  int duration_ms = 3000) override {
+        ShowNotification(notification.c_str(), duration_ms);
+    }
+
+    virtual void SetChatMessage(const char* role, const char* content) override {
+        // 底部字幕条永久隐藏：所有可显示的提示都走顶部纯白文字。
+        DisplayLockGuard lock(this);
+        if (bottom_bar_ != nullptr) {
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (silent_phase_ || content == nullptr || content[0] == '\0') {
+            return;
+        }
+        if (role != nullptr && strcmp(role, "system") != 0) {
+            return;
+        }
+        // SetupUI 之后的第一条是 User-Agent 调试信息，不打扰界面。
+        if (SystemInfo::GetUserAgent() == content) {
+            return;
+        }
+        ShowTopText(content);
+    }
+
+    virtual void ClearChatMessages() override {
+        DisplayLockGuard lock(this);
+        if (bottom_bar_ != nullptr) {
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    virtual void SetEmotion(const char* emotion) override {
+        if (grok_avatar_ == nullptr || emotion == nullptr || app_mode_) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        grok_avatar_->SetEmotion(emotion);
+    }
+
+    // 皮肤资源（工厂 assets 里的蓝色渐变底图 + 小机器人水印）会在换肤/加载字体时
+    // 重新贴到 container_ 上，正好盖在开机睁眼动画下面。GrokBot 自己就是整屏，
+    // 每次换肤后都把背景压回纯黑、并再次隐藏 AI 机器人图标。
+    virtual void SetTheme(Theme* theme) override {
+        DisplayLockGuard lock(this);
+        // 关键：在基类之前就把皮肤底图摘掉。基类 SetTheme 会直接把
+        // background_image 设到 container_ 上，之后再清掉时那一帧早已被刷到
+        // 屏上（开机一瞬的蓝色锯齿底纹）。先清主题字段，基类拿到的就是无
+        // 底图的主题，只会设纯黑底，从源头不可能再出现那张图。
+        if (theme != nullptr) {
+            auto* lvgl_theme = static_cast<LvglTheme*>(theme);
+            lvgl_theme->set_background_image(nullptr);
+            lvgl_theme->set_background_color(lv_color_hex(0x000000));
+            lvgl_theme->set_chat_background_color(lv_color_hex(0x000000));
+            // 应用框架的 UI 字体：主题自带的中文字体（支持任意汉字）。
+            // 注意：动态字体重载时 LvglDisplay::SetTextFont 会替换主题字体并释放旧
+            // LvglFont 对象，而 LVGL 样式里保存的是裸 lv_font_t*。应用层会跨很长的
+            // 时间持有该指针，所以这里额外持有 shared_ptr 保活，避免应用一打开就
+            // 使用已释放的字体（表现为进入应用瞬间重启）。
+            auto text_font = lvgl_theme->text_font();
+            if (text_font != nullptr && text_font->font() != nullptr) {
+                ui_font_ = text_font->font();
+                KeepFontAlive(text_font);
+            } else {
+                ui_font_ = nullptr;
+            }
+        }
+        SpiLcdDisplay::SetTheme(theme);
+        ApplyGrokBackdrop();
+    }
+
+    virtual void SetupUI() override {
+        // 先锁渲染再建基础 UI：否则在创建状态栏/机器人标签的过程中，
+        // 渲染任务会刷出一帧「蓝色底图 + 小机器人 + 正在初始化」，
+        // 这就是开机时一闪而过的底纹。锁住后屏上只会出现我们收尾后的纯黑帧。
+        DisplayLockGuard lock(this);
+        SpiLcdDisplay::SetupUI();
+        // 原生顶栏与状态栏整体移除：屏幕上不留任何底框，提示文字改用自建纯白标签。
+        if (top_bar_ != nullptr) {
+            lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (status_bar_ != nullptr) {
+            lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (notification_label_ != nullptr) {
+            lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
         }
         // 聊天区（仅微信气泡样式才有；默认大 emoji 样式下 content_ 为 null，此段空转）
         if (content_ != nullptr) {
             lv_obj_set_style_pad_left(content_, 44, 0);
             lv_obj_set_style_pad_right(content_, 44, 0);
         }
-        // 底部字幕条（默认样式：bottom_bar_ + chat_message_label_ 单行滚动）：
-        // 上游贴底全宽(360) 会被圆屏下缘弧切 + 左右两端出圆；这里抬进圆内、
-        // 按该高度的弦宽加宽到 240（尽量长条、又不超出圆），做半透圆角胶囊，保留单行滚动。
-        // 配网提示与对话字幕共用这一个控件（Alert→SetChatMessage），改一处两边同步。
+        // 底部字幕条永久隐藏：GrokBot 版只在顶部用纯白文字提示，互动阶段不显示任何文字。
         if (bottom_bar_ != nullptr) {
-            lv_obj_set_width(bottom_bar_, 240);
-            lv_obj_set_style_radius(bottom_bar_, 999, 0);                    // 胶囊圆角（LVGL 自动限幅到 h/2）
-            lv_obj_set_style_bg_color(bottom_bar_, lv_color_hex(0x000000), 0);
-            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_20, 0);             // 浅灰药丸：10% 在白底上太淡，对话态反光/滚动时几乎看不见，提到 20% 稳定可见
-            lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -50);         // 抬进可视圆内
-            lv_obj_move_foreground(bottom_bar_);                            // 兜底：防对话态任何层压住胶囊底
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
-        if (chat_message_label_ != nullptr) {
-            lv_obj_set_width(chat_message_label_, 216);                     // 胶囊内安全宽度
-            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);  // 保留单行滚动
-            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+        // 顶部提示：去掉状态栏底框，文字统一纯白（形象为深色，白字直接浮在上面）。
+        if (top_bar_ != nullptr) {
+            lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
+        }
+        lv_obj_t* const icon_labels[] = {network_label_, mute_label_, battery_label_};
+        for (auto label : icon_labels) {
+            if (label != nullptr) {
+                lv_obj_set_style_text_color(label, lv_color_white(), 0);
+            }
+        }
+        if (status_label_ != nullptr) {
+            lv_obj_set_width(status_label_, 240);
+            lv_label_set_long_mode(status_label_, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_color(status_label_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(status_label_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+        }
+        if (notification_label_ != nullptr) {
+            lv_obj_set_width(notification_label_, 240);
+            lv_obj_set_style_text_color(notification_label_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(notification_label_, LV_OPA_TRANSP, 0);
+        }
+        // 原 emoji 层彻底隐藏，改由 GrokBot 自绘形象占满整屏。
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_label_ != nullptr) {
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
         }
         // 低电提示（底部 y≈320..340，弦宽急剧变窄）：缩窄并上提
         if (low_battery_popup_ != nullptr) {
             lv_obj_set_width(low_battery_popup_, 160);
             lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -48);
         }
+        if (grok_avatar_ == nullptr) {
+            grok_avatar_ = new GrokbotAvatar();
+            grok_avatar_->Create(lv_screen_active(), width_, height_);
+            // 形象整屏自绘（黑底 + 眼睛），必须压在皮肤底图/机器人图标之上；
+            // 顶部提示与控制中心随后再 move_foreground，仍会盖在它上面。
+            lv_obj_move_foreground(grok_avatar_->obj());
+            // 低电提示平时隐藏，展示时要浮在形象之上（形象是整屏不透明层）。
+            if (low_battery_popup_ != nullptr) {
+                lv_obj_move_foreground(low_battery_popup_);
+            }
+        }
+        // 自建顶部提示：纯白文字、无底框、无边框（只用于配网/联网等非交互阶段）。
+        if (grok_text_ == nullptr) {
+            grok_text_ = lv_label_create(lv_screen_active());
+            lv_obj_set_width(grok_text_, 176);
+            lv_label_set_long_mode(grok_text_, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(grok_text_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(grok_text_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(grok_text_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(grok_text_, 0, 0);
+            lv_obj_set_style_pad_all(grok_text_, 0, 0);
+            lv_obj_align(grok_text_, LV_ALIGN_TOP_MID, 0, 18);
+            lv_obj_add_flag(grok_text_, LV_OBJ_FLAG_HIDDEN);
+        }
+        // 交互状态点：14px 圆点 + 同色柔光，绿=聆听 / 黄=思考 / 白=说话。
+        if (grok_dot_ == nullptr) {
+            grok_dot_ = lv_obj_create(lv_screen_active());
+            lv_obj_remove_style_all(grok_dot_);
+            lv_obj_set_size(grok_dot_, 14, 14);
+            lv_obj_set_style_radius(grok_dot_, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_opa(grok_dot_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(grok_dot_, lv_color_hex(0x35D07A), 0);
+            lv_obj_set_style_shadow_width(grok_dot_, 18, 0);
+            lv_obj_set_style_shadow_spread(grok_dot_, 3, 0);
+            lv_obj_set_style_shadow_opa(grok_dot_, 120, 0);
+            lv_obj_set_style_shadow_color(grok_dot_, lv_color_hex(0x35D07A), 0);
+            lv_obj_align(grok_dot_, LV_ALIGN_TOP_MID, 0, 36);
+            lv_obj_clear_flag(grok_dot_, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(grok_dot_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_move_foreground(grok_text_);
+        lv_obj_move_foreground(grok_dot_);
+        ApplyGrokBackdrop();
         if (on_setup_done) {
             on_setup_done();
         }
+        BootLightUp();
     }
+
+    // 开机点亮：先把「纯黑 + 闭眼」刷进面板 GRAM，再开背光，最后才睁眼。
+    // 这样开机阶段的所有残留画面（厂方蓝底图、面板上电雪花、皮肤底图那一帧）
+    // 都发生在背光关闭期间，用户看到的第一帧就是我们画的黑底闭眼。
+    void BootLightUp() {
+        lv_obj_invalidate(lv_screen_active());
+        lv_timer_create([](lv_timer_t* t) {
+            auto* self = static_cast<SdgoodsRoundLcdDisplay*>(lv_timer_get_user_data(t));
+            Backlight* backlight = Board::GetInstance().GetBacklight();
+            if (backlight != nullptr) {
+                backlight->RestoreBrightness();
+            }
+            if (self->grok_avatar_ != nullptr) {
+                self->grok_avatar_->StartIntro();
+            }
+            lv_timer_delete(t);
+        }, 90, this);
+    }
+
+public:
+    // 控制中心等全屏浮层打开时暂停形象刷新，避免无意义的全屏重绘。
+    void SetGrokPaused(bool paused) {
+        if (grok_avatar_ != nullptr) {
+            grok_avatar_->SetPaused(paused);
+        }
+    }
+
+    // 应用（应用中心/设备信息等）使用的主题字体，可能为空（调用方自行回退）。
+    const lv_font_t* UiFont() const {
+        if (ui_font_ != nullptr) {
+            return ui_font_;
+        }
+        return grok_text_ != nullptr ? lv_obj_get_style_text_font(grok_text_, LV_PART_MAIN) : nullptr;
+    }
+
+    // 应用模式：应用独占屏幕时隐藏形象、状态点与顶部文字；退出时恢复待机形象。
+    void SetAssistantSurface(bool visible) {
+        app_mode_ = !visible;
+        if (visible) {
+            if (grok_avatar_ != nullptr) {
+                lv_obj_remove_flag(grok_avatar_->obj(), LV_OBJ_FLAG_HIDDEN);
+                grok_avatar_->SetMode(GrokbotAvatar::Mode::Standby);
+                grok_avatar_->SetPaused(false);
+            }
+        } else if (grok_avatar_ != nullptr) {
+            grok_avatar_->SetPaused(true);
+            lv_obj_add_flag(grok_avatar_->obj(), LV_OBJ_FLAG_HIDDEN);
+        }
+        HideTopText();
+        SetDot(0, false);
+    }
+
+private:
+    // 主题字体可能在运行期被动态字体重载替换并释放；应用层持有裸指针，
+    // 因此把用过的字体对象都保活（去重，最多保留最近 4 个）。
+    void KeepFontAlive(const std::shared_ptr<LvglFont>& font) {
+        for (const auto& kept : app_font_keepalive_) {
+            if (kept.get() == font.get()) {
+                return;
+            }
+        }
+        app_font_keepalive_.push_back(font);
+        if (app_font_keepalive_.size() > 4) {
+            app_font_keepalive_.erase(app_font_keepalive_.begin());
+        }
+    }
+
+    // 开机只留一张纯黑底：screen 与 container 都清掉皮肤背景图（工厂 assets
+    // 的蓝色渐变 + 小机器人水印就是从这里冒出来的），并再次藏掉 AI 机器人图标。
+    void ApplyGrokBackdrop() {
+        lv_obj_t* screen = lv_screen_active();
+        if (screen != nullptr) {
+            lv_obj_set_style_bg_image_src(screen, nullptr, 0);
+            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
+        }
+        if (container_ != nullptr) {
+            lv_obj_set_style_bg_image_src(container_, nullptr, 0);
+            lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(container_, lv_color_hex(0x000000), 0);
+        }
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_label_ != nullptr) {
+            lv_label_set_text(emoji_label_, "");
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (screen != nullptr) {
+            lv_obj_invalidate(screen);
+        }
+    }
+
+    GrokbotAvatar* grok_avatar_ = nullptr;
+    lv_obj_t* grok_text_ = nullptr;
+    lv_obj_t* grok_dot_ = nullptr;
+    Phase phase_ = Phase::None;
+    bool silent_phase_ = false;
+    // 应用独占屏幕：此后所有小智状态文案/状态点/表情更新都被忽略，
+    // 直到应用退出（SetAssistantSurface(true)）。防止后台会话把 UI 抢回来。
+    bool app_mode_ = false;
+    const lv_font_t* ui_font_ = nullptr;   // 主题中文字体（应用 UI 使用）
+    std::vector<std::shared_ptr<LvglFont>> app_font_keepalive_;   // 防止 ui_font_ 悬空
 };
 
 // ST77916 QSPI 屏厂初始化序列（谷仓次元屏实测可用）
@@ -281,13 +653,74 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_sdgoods[] = {
     {0xF0, (uint8_t []){0x00}, 1, 0},
     {0x21, (uint8_t []){0x00}, 1, 0},
     {0x11, (uint8_t []){0x00}, 1, 120},
+    /* TEON：打开面板 TE(V-blank) 输出，配合 GPIO18 做帧同步。
+     * 参数 0x00 = 仅 V-blank 期间输出高电平脉冲，正好是「一帧开始扫描」的时刻。 */
+    {0x35, (uint8_t []){0x00}, 1, 0},
     {0x29, (uint8_t []){0x00}, 1, 0},
 };
+
+// ===== 面板 TE（帧起始）帧同步 =====
+// 换肤整屏滑动时，一帧 259200B 的 GRAM 写入要 6~7ms，而面板扫描一帧 16.7ms。
+// 如果写入起点是随机的，写入就会跨过扫描线，屏上出现「半帧旧 + 半帧新」的撕裂，
+// 在手机卷帘快门里就表现为斜着的像素块。把写入起点对齐到 TE 上升沿（V-blank）后，
+// 写入前沿始终领先扫描前沿，撕裂消失。
+// TE 是可选信号：上电探测不到（GPIO 一直是低电平）就自动放弃等待，行为与之前完全一致。
+static SemaphoreHandle_t s_te_sem = nullptr;
+static volatile bool s_te_ready = false;
+
+static void IRAM_ATTR sdgoods_te_isr(void*) {
+    BaseType_t woken = pdFALSE;
+    if (s_te_sem != nullptr) {
+        xSemaphoreGiveFromISR(s_te_sem, &woken);
+    }
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static bool sdgoods_te_wait(uint32_t timeout_ms) {
+    if (!s_te_ready || s_te_sem == nullptr) {
+        return false;
+    }
+    // 丢弃上一帧残留的计数，确保等的是「下一个」帧起点
+    xSemaphoreTake(s_te_sem, 0);
+    return xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void sdgoods_te_init() {
+    s_te_sem = xSemaphoreCreateBinary();
+    if (s_te_sem == nullptr) {
+        return;
+    }
+    gpio_config_t cfg = {};
+    cfg.pin_bit_mask = 1ULL << QSPI_PIN_NUM_LCD_TE;
+    cfg.mode = GPIO_MODE_INPUT;
+    cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_ENABLE;  // 未引出时保持低电平，探测安全
+    cfg.intr_type = GPIO_INTR_POSEDGE;
+    gpio_config(&cfg);
+
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "gpio isr service: %s", esp_err_to_name(err));
+        return;
+    }
+    gpio_isr_handler_add(QSPI_PIN_NUM_LCD_TE, sdgoods_te_isr, nullptr);
+
+    if (xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(150)) == pdTRUE) {
+        s_te_ready = true;
+        SpiLcdDisplay::SetFlushSyncHook(sdgoods_te_wait);
+        ESP_LOGI(TAG, "Panel TE detected on GPIO%d, flush synced to frame start", QSPI_PIN_NUM_LCD_TE);
+    } else {
+        ESP_LOGW(TAG, "Panel TE not detected on GPIO%d, flush stays free-running", QSPI_PIN_NUM_LCD_TE);
+    }
+}
 
 class SdgoodsDimensionScreen : public WifiBoard {
 private:
     Button boot_button_;
     SdgoodsRoundLcdDisplay* display_;
+    AppHost app_host_;   // 应用框架：应用层 + 单应用生命周期（见 main/apps）
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
     AdcBatteryMonitor* battery_monitor_ = nullptr;
 
@@ -339,7 +772,7 @@ private:
                                                                         QSPI_PIN_NUM_LCD_DATA1,
                                                                         QSPI_PIN_NUM_LCD_DATA2,
                                                                         QSPI_PIN_NUM_LCD_DATA3,
-                                                                        QSPI_LCD_H_RES * 80 * sizeof(uint16_t));
+                                                                        DISPLAY_SPI_MAX_TRANSFER_SZ);
         ESP_ERROR_CHECK(spi_bus_initialize(QSPI_LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
     }
 
@@ -353,7 +786,7 @@ private:
             .dc_gpio_num = GPIO_NUM_NC,
             .spi_mode = 0,
             .pclk_hz = DISPLAY_SPI_PCLK_HZ,
-            .trans_queue_depth = 10,
+            .trans_queue_depth = DISPLAY_SPI_TRANS_QUEUE_DEPTH,
             .on_color_trans_done = NULL,
             .user_ctx = NULL,
             .lcd_cmd_bits = 32,
@@ -388,11 +821,41 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
+        // TEON 已在初始化表里打开；这里探测 TE 信号是否存在并接管 flush 帧同步
+        sdgoods_te_init();
+
+        // 面板一开就先把 GRAM 刷成近黑：上电后到 LVGL 首次整屏刷新之间有几秒，
+        // 期间屏上会留着厂方开机画面（蓝色渐变 + 小机器人）。这里用 DMA 条带
+        // 直接清屏，让「开机」从第一帧就是纯黑底。
+        {
+            constexpr int kStrip = 8;
+            size_t strip_px = static_cast<size_t>(DISPLAY_WIDTH) * kStrip;
+            uint16_t* strip =
+                static_cast<uint16_t*>(heap_caps_malloc(strip_px * sizeof(uint16_t),
+                                                        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            if (strip != nullptr) {
+                for (size_t i = 0; i < strip_px; i++) {
+                    strip[i] = 0x0000;  // RGB565 近黑
+                }
+                for (int y = 0; y < DISPLAY_HEIGHT; y += kStrip) {
+                    int y2 = y + kStrip;
+                    if (y2 > DISPLAY_HEIGHT) {
+                        y2 = DISPLAY_HEIGHT;
+                    }
+                    esp_lcd_panel_draw_bitmap(panel, 0, y, DISPLAY_WIDTH, y2, strip);
+                }
+                heap_caps_free(strip);
+            }
+        }
+
         display_ = new SdgoodsRoundLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                                    /*fullscreen_psram_buf=*/false);  // 保持内部 SRAM DMA 部分缓冲：QSPI esp_lcd 走满屏 PSRAM 需 ~259KB DMA 回弹缓冲，内部 RAM 不够会 setup_dma_priv_buffer 失败并卡死 flush（实测），20 行 DMA 反而是最快可用路径
-        // 上游 SetupUI 由 Application::Start 触发，建完容器后再叠控制中心浮层
-        display_->on_setup_done = [this]() { SetupControlCenter(); };
+                                    /*fullscreen_psram_buf=*/true);  // 整屏 PSRAM 双缓冲：一帧只做一次整屏 flush（见 lcd_display.cc / config.h 的说明）
+        // 上游 SetupUI 由 Application::Start 触发，建完容器后先叠应用层，再叠控制中心浮层
+        display_->on_setup_done = [this]() {
+            SetupAppLayer();
+            SetupControlCenter();
+        };
     }
 
     void InitializeI2c() {
@@ -537,6 +1000,11 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            // 应用内：唯一实体键 = 返回桌面（规则 1/7），小智在此阶段不参与。
+            if (app_host_.IsActive()) {
+                ExitApp();
+                return;
+            }
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -569,6 +1037,141 @@ private:
                 ScreenWake();
                 return true;
             });
+
+        // ---- 应用框架（M2）：应用中心 + 语音入口 ----
+        mcp_server.AddTool("self.apps.center",
+            "Open the app center on the device screen. Call when the user asks to show/see their apps, "
+            "open the app center or list apps on the screen (显示我的应用/我有哪些应用/进入应用中心/打开应用列表).",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                LaunchApp("app_center");
+                return true;
+            });
+        mcp_server.AddTool("self.apps.list",
+            "List the apps installed on this device. Call when the user asks what apps are available "
+            "(我的应用/我有哪些应用/打开应用列表). Do not open the app center for a named app; use self.apps.launch.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                // 只返回清单，不再顺带打开应用中心：否则“打开网络电台”时模型先列应用，
+                // 用户看到的就是应用中心（真正要开的 App 反而没进）。
+                int count = 0;
+                const AppEntry* entries = GetAppRegistry(&count);
+                std::string text;
+                for (int i = 0; i < count; ++i) {
+                    if (entries[i].info == nullptr || entries[i].info->id == nullptr) {
+                        continue;
+                    }
+                    if (!text.empty()) {
+                        text += "; ";
+                    }
+                    text += entries[i].info->id;
+                    text += " = ";
+                    text += entries[i].info->name;
+                }
+                return text;
+            });
+        std::string launch_desc =
+            "Open one specific app on the device screen. Accepts the app id or its Chinese name "
+            "(e.g. \"radio\" or \"网络电台\"). Call this whenever the user names an app; do NOT call "
+            "self.apps.center for a named app. Installed apps: ";
+        {
+            int count = 0;
+            const AppEntry* entries = GetAppRegistry(&count);
+            for (int i = 0; i < count; ++i) {
+                if (entries[i].info == nullptr || entries[i].info->id == nullptr) {
+                    continue;
+                }
+                if (i > 0) {
+                    launch_desc += "; ";
+                }
+                launch_desc += entries[i].info->id;
+                launch_desc += " = ";
+                launch_desc += entries[i].info->name;
+            }
+        }
+        mcp_server.AddTool("self.apps.launch", launch_desc,
+            PropertyList({Property("id", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string id = properties["id"].value<std::string>();
+                LaunchApp(id.c_str());
+                return true;
+            });
+        mcp_server.AddTool("self.apps.exit",
+            "Close the running app and return to the assistant desktop.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                ExitApp();
+                return true;
+            });
+    }
+
+    // ---------- 应用框架（M1）：应用层 + 进入/退出编排 ----------
+    // 层级：形象 < 应用层(app_host_) < 控制中心页。应用层建立在控制中心之前，
+    // 所以控制中心永远盖在应用之上（规则 4）。
+    void SetupAppLayer() {
+        AppHost::Hooks hooks;
+        hooks.on_enter = [this]() { EnterAppSurface(); };
+        hooks.on_exit = [this]() { LeaveAppSurface(); };
+        app_host_.Init(lv_screen_active(), DISPLAY_WIDTH, DISPLAY_HEIGHT, display_->UiFont(), hooks);
+        // 开机即后台预热电台目录：第一次进电台也不必等网络（有新鲜缓存时只读 NVS）。
+        radio_startup_warmup();
+    }
+
+    // 进入应用：关掉控制中心 → 藏形象/状态点/文字 → 结束会话并关闭唤醒词闸门。
+    void EnterAppSurface() {
+        DeleteAllCcPages();
+        display_->SetAssistantSurface(false);
+        Application::GetInstance().SetInteractionSuppressed(true);
+    }
+
+    void LeaveAppSurface() {
+        display_->SetAssistantSurface(true);
+        Application::GetInstance().SetInteractionSuppressed(false);
+    }
+
+    // 调用方已持 LVGL 锁。
+    bool LaunchAppLocked(const char* id) {
+        auto state = Application::GetInstance().GetDeviceState();
+        if (state == kDeviceStateStarting || state == kDeviceStateActivating ||
+            state == kDeviceStateWifiConfiguring) {
+            return false;   // 启动/配网阶段不接管屏幕
+        }
+        // 每次进入都现取主题字体：动态字体重载后旧指针可能已释放，
+        // 不能沿用 Init 时捕获的那一个。
+        app_host_.SetFont(display_->UiFont());
+        // 语音在应用内切换：走 SwitchToAsync（内部 suppress_exit_hook + DoExit），
+        // 不能 Exit()->Enter()：Exit 会恢复助理界面（on_exit），再把屏幕交回桌面，
+        // 于是看起来还是停在应用中心；紧接着 Enter 还可能和界面恢复竞争导致重启。
+        if (app_host_.IsActive()) {
+            ESP_LOGI(TAG, "app switch -> '%s'", id);
+            app_host_.SwitchToAsync(id);
+            return true;
+        }
+        bool ok = app_host_.Enter(id);
+        ESP_LOGI(TAG, "app open '%s' -> %d", id, (int)ok);
+        return ok;
+    }
+
+    // 语音/外部入口：任意任务可调用（切回主任务并加 LVGL 锁）。
+    void LaunchApp(const char* id) {
+        std::string app_id = id != nullptr ? id : "";
+        Application::GetInstance().Schedule([this, app_id]() {
+            if (display_ == nullptr) {
+                return;
+            }
+            DisplayLockGuard lock(display_);
+            LaunchAppLocked(app_id.c_str());
+        });
+    }
+
+    void ExitApp() {
+        Application::GetInstance().Schedule([this]() {
+            if (display_ == nullptr) {
+                return;
+            }
+            DisplayLockGuard lock(display_);
+            app_host_.Exit();
+        });
     }
 
     // ---------- 下拉控制中心（1:1 照搬原厂 sdgoods_cc.c） ----------
@@ -578,7 +1181,10 @@ private:
     // 点开进二级滑块/数据/电量/关于页（文案与几何均对齐原厂）。
     // lv_style_selector_t 是 uint32_t（part<<16 | state），直接用枚举常量组合
     static constexpr lv_style_selector_t kSel() { return LV_PART_MAIN; }
-    static constexpr lv_style_selector_t kSelPressed() { return LV_PART_MAIN | LV_STATE_PRESSED; }
+    static constexpr lv_style_selector_t kSelPressed() {
+        return static_cast<lv_style_selector_t>(LV_PART_MAIN) |
+               static_cast<lv_style_selector_t>(LV_STATE_PRESSED);
+    }
     static constexpr lv_style_selector_t kSelIndicator() { return LV_PART_INDICATOR; }
     static constexpr lv_style_selector_t kSelKnob() { return LV_PART_KNOB; }
 
@@ -586,6 +1192,10 @@ private:
     // 主界面是白底、本页是纯黑，半透明过渡会被部分缓冲逐格刷出，肉眼看到
     // “白→灰→黑”的渐进过程，反而被误判成卡顿；原厂就是瞬间整屏黑，干脆利落。
     lv_obj_t* CreateCcPage() {
+        if (display_ != nullptr) {
+            display_->SetGrokPaused(true);  // 全屏黑底浮层：无需继续渲染形象
+        }
+        app_host_.PauseForOverlay(true);    // 应用在控制中心打开期间暂停（规则 4）
         auto page = lv_obj_create(lv_screen_active());
         lv_obj_remove_style_all(page);
         lv_obj_set_size(page, DISPLAY_WIDTH, DISPLAY_HEIGHT);
@@ -865,7 +1475,17 @@ private:
         if (page != nullptr) {
             auto p = page;
             page = nullptr;
+            lv_anim_delete(p, nullptr);  // 取消挂在它身上的高度动画，避免删除后回调访问野指针
             lv_obj_delete(p);   // 瞬间关闭，无淡出（理由同 CreateCcPage 注释）
+        }
+        if (display_ != nullptr && cc_page_ == nullptr && cc_set_page_ == nullptr &&
+            cc_slider_page_ == nullptr && cc_data_page_ == nullptr && cc_battery_page_ == nullptr &&
+            cc_about_page_ == nullptr) {
+            // 应用仍在前台时保持形象暂停（应用模式下形象本就是隐藏的）。
+            if (!app_host_.IsActive()) {
+                display_->SetGrokPaused(false);
+            }
+            app_host_.PauseForOverlay(false);
         }
     }
     void DeleteAllCcPages() {
@@ -931,6 +1551,42 @@ private:
     }
 
     // 一级页：原厂三键「Settings / About / Power」同款布局与坐标（cx=84/180/276，cy=169）
+    // ===== 控制中心整页上下滑动（整页一起动，帧间无残影） =====
+    // 只改整页 y：一帧一次整屏刷新，和面板扫描同节奏；不再做逐行高度展开。
+    static void CcSlideYExec(void* obj, int32_t v) {
+        lv_obj_set_y(static_cast<lv_obj_t*>(obj), v);
+    }
+    static void CcCollapseDone(void* arg) {
+        static_cast<SdgoodsDimensionScreen*>(arg)->DeleteAllCcPages();
+    }
+    static void CcCollapseReady(lv_anim_t* a) {
+        // 动画回调里不动对象树，下一拍再删
+        lv_async_call(CcCollapseDone, static_cast<SdgoodsDimensionScreen*>(lv_anim_get_user_data(a)));
+    }
+    static void CcSlideYAnimate(lv_obj_t* page, int32_t from, int32_t to, uint32_t ms) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, page);
+        lv_anim_set_values(&a, from, to);
+        lv_anim_set_duration(&a, ms);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_set_exec_cb(&a, CcSlideYExec);
+        lv_anim_start(&a);
+    }
+    // 收起：整页抬到 -360，动画结束后下一拍删页
+    void CcCollapseAnimate(lv_obj_t* page) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, page);
+        lv_anim_set_values(&a, lv_obj_get_y(page), -DISPLAY_HEIGHT);
+        lv_anim_set_duration(&a, 100);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_set_exec_cb(&a, CcSlideYExec);
+        lv_anim_set_user_data(&a, this);
+        lv_anim_set_completed_cb(&a, CcCollapseReady);
+        lv_anim_start(&a);
+    }
+
     void OpenControlCenter() {
         if (cc_page_ != nullptr) {
             return;
@@ -943,6 +1599,9 @@ private:
         CreateCcTile(page, 276, 169, CC_ICON_PWR, "关机", OnTilePower);
         CreateCcBottomHint(page);
         BindCloseGesture(page, /*down=*/false);  // 整页上滑关闭（下拉打开后，上滑收起，符合直觉且与子页一致）
+        // 下拉展开：整页从屏幕上方滑到 0，100ms 减速曲线，像手机下拉控制中心
+        lv_obj_set_y(page, -DISPLAY_HEIGHT);
+        CcSlideYAnimate(page, -DISPLAY_HEIGHT, 0, 100);
     }
 
     // 二级设置页：原厂上排 Volume/Brightness/Data（cy=130）+ 下排 Battery（84,230），
@@ -1126,7 +1785,18 @@ private:
     }
 
     void CloseControlCenter() {
-        DeleteAllCcPages();
+        if (cc_page_ == nullptr) {
+            return;
+        }
+        // 有二级页时直接整栈收掉（二级页不做动画，收得更干净）
+        if (cc_set_page_ != nullptr || cc_slider_page_ != nullptr || cc_data_page_ != nullptr ||
+            cc_battery_page_ != nullptr || cc_about_page_ != nullptr) {
+            DeleteAllCcPages();
+            return;
+        }
+        // 先取消可能还在跑的展开动画，再从当前 y 整体抬起
+        lv_anim_delete(cc_page_, CcSlideYExec);
+        CcCollapseAnimate(cc_page_);
     }
 
     std::string BuildInfoText() {
@@ -1168,7 +1838,8 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
-        GetBacklight()->RestoreBrightness();
+        // 背光保持关闭直到 SetupUI 完成：见 SdgoodsRoundLcdDisplay::BootLightUp()。
+        // 开机阶段面板里可能还有厂方残留画面，背光不开就什么也看不到。
     }
 
     virtual AudioCodec* GetAudioCodec() override {

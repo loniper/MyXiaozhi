@@ -721,27 +721,9 @@ void Application::InitializeProtocol() {
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
-    struct digit_sound {
-        char digit;
-        const std::string_view& sound;
-    };
-    static const std::array<digit_sound, 10> digit_sounds{
-        {digit_sound{'0', Lang::Sounds::OGG_0}, digit_sound{'1', Lang::Sounds::OGG_1},
-         digit_sound{'2', Lang::Sounds::OGG_2}, digit_sound{'3', Lang::Sounds::OGG_3},
-         digit_sound{'4', Lang::Sounds::OGG_4}, digit_sound{'5', Lang::Sounds::OGG_5},
-         digit_sound{'6', Lang::Sounds::OGG_6}, digit_sound{'7', Lang::Sounds::OGG_7},
-         digit_sound{'8', Lang::Sounds::OGG_8}, digit_sound{'9', Lang::Sounds::OGG_9}}};
-
-    // This sentence uses 9KB of SRAM, so we need to wait for it to finish
-    Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
-
-    for (const auto& digit : code) {
-        auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
-                               [digit](const digit_sound& ds) { return ds.digit == digit; });
-        if (it != digit_sounds.end()) {
-            audio_service_.PlaySound(it->sound);
-        }
-    }
+    (void)code;
+    // 配网/联网阶段不播放任何语音，激活码只显示在屏幕顶部。
+    Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", std::string_view());
 }
 
 void Application::Alert(const char* status, const char* message, const char* emotion,
@@ -837,6 +819,9 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+    if (interaction_suppressed_) {
+        return;
+    }
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -890,7 +875,7 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
-    if (!protocol_) {
+    if (!protocol_ || interaction_suppressed_) {
         return;
     }
 
@@ -923,6 +908,42 @@ void Application::HandleWakeWordDetectedEvent() {
     } else if (state == kDeviceStateActivating) {
         // Restart the activation check if the wake word is detected during activation
         SetDeviceState(kDeviceStateIdle);
+    }
+}
+
+void Application::SetInteractionSuppressed(bool suppressed) {
+    if (interaction_suppressed_ == suppressed) {
+        return;
+    }
+    interaction_suppressed_ = suppressed;
+    audio_service_.SetWakeWordSuppressed(suppressed);
+    if (suppressed) {
+        // End the session itself, not just the wake word path: an app owns the
+        // screen, so an already-open conversation must not keep listening and
+        // transcribing what the user says. Closing the channel and forcing idle
+        // also stops any pending auto-listen.
+        Schedule([this]() {
+            if (!interaction_suppressed_) {
+                return;
+            }
+            pending_listening_start_ = false;
+            if (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
+                protocol_->CloseAudioChannel();
+            }
+            audio_service_.EnableVoiceProcessing(false);
+            if (GetDeviceState() != kDeviceStateIdle) {
+                SetDeviceState(kDeviceStateIdle);
+            }
+        });
+    } else {
+        // Back on the desktop: reopen the gate only from idle, mirroring the idle
+        // state handler so we never enable detection mid-conversation.
+        Schedule([this]() {
+            if (interaction_suppressed_ || GetDeviceState() != kDeviceStateIdle) {
+                return;
+            }
+            audio_service_.EnableWakeWordDetection(true);
+        });
     }
 }
 
@@ -1012,7 +1033,7 @@ void Application::HandleStateChangedEvent() {
                     "neutral");  // Then set emotion (wechat mode checks child count)
             }
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableWakeWordDetection(!interaction_suppressed_);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);

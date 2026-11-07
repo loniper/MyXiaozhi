@@ -660,6 +660,11 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 
 void AudioService::EnableWakeWordDetection(bool enable) {
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
+    if (enable && wake_word_suppressed_) {
+        // An app owns the screen: keep the microphone out of the wake word path.
+        xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        return;
+    }
     if (enable) {
         if (!InitializeAudioEngine()) {
             xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
@@ -689,6 +694,16 @@ void AudioService::EnableWakeWordDetection(bool enable) {
             audio_engine_->EnableWakeWordDetection(false);
         }
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+    }
+}
+
+void AudioService::SetWakeWordSuppressed(bool suppressed) {
+    if (wake_word_suppressed_ == suppressed) {
+        return;
+    }
+    wake_word_suppressed_ = suppressed;
+    if (suppressed) {
+        EnableWakeWordDetection(false);
     }
 }
 

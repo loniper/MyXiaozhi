@@ -134,6 +134,11 @@ public:
     bool IsAfeWakeWord();
 
     void EnableWakeWordDetection(bool enable);
+
+    // Hard gate used by the app framework: while suppressed, every request to
+    // enable wake word detection is ignored, so a running conversation or a
+    // state change cannot silently re-arm it behind an app's back.
+    void SetWakeWordSuppressed(bool suppressed);
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
@@ -152,6 +157,7 @@ private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
     std::unique_ptr<AudioEngine> audio_engine_;
+    bool wake_word_suppressed_ = false;   // App framework gate (see SetWakeWordSuppressed)
     std::unique_ptr<AudioDebugger> audio_debugger_;
     void* opus_encoder_ = nullptr;
     void* opus_decoder_ = nullptr;

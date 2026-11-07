@@ -32,11 +32,14 @@ SdgoodsAudioCodec::SdgoodsAudioCodec(int input_sample_rate, int output_sample_ra
     gpio_set_level(pa_gpio_, 0);
 
     // Create a new channel for speaker (I2S 控制器 0，16bit 立体声 + MCLK)
+    // TX 的 DMA 垫底由 6×5ms≈30ms 加深到 6×10.7ms≈64ms（48kHz）：
+    // 电台持续解码 + LVGL 刷屏同时跑时，任务调度抖动常到 30~50ms，
+    // 原来刚好卡在 30ms 上就会周期性掉一小段；加深后这段抖动被 DMA 吃掉。
     i2s_chan_config_t chan_cfg = {
         .id = XIAOZHI_I2S_PORT(0),
         .role = I2S_ROLE_MASTER,
-        .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
-        .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
+        .dma_desc_num = 6,
+        .dma_frame_num = 480,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
         .intr_priority = 0,
@@ -82,7 +85,9 @@ SdgoodsAudioCodec::SdgoodsAudioCodec(int input_sample_rate, int output_sample_ra
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
 
     // Create a new channel for MIC (I2S 控制器 1，32bit 单声道左槽)
+    // MIC 不需要那么深的垫底，恢复默认，省内部 RAM。
     chan_cfg.id = XIAOZHI_I2S_PORT(1);
+    chan_cfg.dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, nullptr, &rx_handle_));
     std_cfg.clk_cfg.sample_rate_hz = (uint32_t)input_sample_rate_;
     std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
@@ -133,7 +138,7 @@ int SdgoodsAudioCodec::Write(const int16_t* data, int samples) {
 }
 
 int SdgoodsAudioCodec::Read(int16_t* dest, int samples) {
-    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    std::lock_guard<std::mutex> lock(rx_mutex_);
     size_t bytes_read;
     constexpr uint32_t kReadTimeoutMs = 200;
 
@@ -152,7 +157,7 @@ int SdgoodsAudioCodec::Read(int16_t* dest, int samples) {
 }
 
 void SdgoodsAudioCodec::EnableInput(bool enable) {
-    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    std::lock_guard<std::mutex> lock(rx_mutex_);
     if (enable == input_enabled_) {
         return;
     }
@@ -179,4 +184,114 @@ void SdgoodsAudioCodec::EnableOutput(bool enable) {
         gpio_set_level(pa_gpio_, 0);
     }
     AudioCodec::EnableOutput(enable);
+}
+
+esp_err_t SdgoodsAudioCodec::StartStream(int sample_rate, int channels) {
+    if (sample_rate <= 0 || channels <= 0 || channels > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (streaming_ && stream_rate_ == sample_rate && stream_channels_ == channels) {
+        return ESP_OK;
+    }
+    if (streaming_) {
+        i2s_channel_disable(tx_handle_);
+        streaming_ = false;
+    } else {
+        i2s_channel_disable(tx_handle_);
+    }
+
+    i2s_std_clk_config_t clk = {
+        .sample_rate_hz = (uint32_t)sample_rate,
+        .clk_src = I2S_CLK_SRC_DEFAULT,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_384,
+        #ifdef I2S_HW_VERSION_2
+            .ext_clk_freq_hz = 0,
+        #endif
+    };
+    esp_err_t err = i2s_channel_reconfig_std_clock(tx_handle_, &clk);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stream clock %d Hz failed: %s", sample_rate, esp_err_to_name(err));
+        return err;
+    }
+
+    gpio_set_level(pa_gpio_, 1);
+    vTaskDelay(pdMS_TO_TICKS(kPaSettleMs));
+    err = i2s_channel_enable(tx_handle_);
+    if (err != ESP_OK) {
+        gpio_set_level(pa_gpio_, 0);
+        ESP_LOGE(TAG, "stream enable failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    stream_rate_ = sample_rate;
+    stream_channels_ = channels;
+    streaming_ = true;
+    output_enabled_ = true;
+    ESP_LOGI(TAG, "stream started: %d Hz ch=%d", sample_rate, channels);
+    return ESP_OK;
+}
+
+esp_err_t SdgoodsAudioCodec::WriteStream(const int16_t* pcm, size_t bytes) {
+    if (pcm == nullptr || bytes < sizeof(int16_t)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (!streaming_) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
+    size_t samples = bytes / sizeof(int16_t);
+    size_t frames = stream_channels_ == 2 ? samples / 2 : samples;
+    if (frames == 0) {
+        return ESP_OK;
+    }
+    stream_buf_.resize(frames * 2);
+    for (size_t i = 0; i < frames; ++i) {
+        int32_t left;
+        int32_t right;
+        if (stream_channels_ == 2) {
+            left = pcm[2 * i];
+            right = pcm[2 * i + 1];
+        } else {
+            left = right = pcm[i];
+        }
+        left = (int32_t)((int64_t)left * volume_factor >> 16);
+        right = (int32_t)((int64_t)right * volume_factor >> 16);
+        stream_buf_[2 * i] = (int16_t)(left > INT16_MAX ? INT16_MAX : (left < INT16_MIN ? INT16_MIN : left));
+        stream_buf_[2 * i + 1] = (int16_t)(right > INT16_MAX ? INT16_MAX : (right < INT16_MIN ? INT16_MIN : right));
+    }
+    size_t written = 0;
+    esp_err_t err = i2s_channel_write(tx_handle_, stream_buf_.data(),
+                                      frames * 2 * sizeof(int16_t), &written,
+                                      pdMS_TO_TICKS(500));
+    if (err != ESP_OK) {
+        return err;
+    }
+    return written == frames * 2 * sizeof(int16_t) ? ESP_OK : ESP_FAIL;
+}
+
+void SdgoodsAudioCodec::StopStream(void) {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (!streaming_) {
+        return;
+    }
+    i2s_channel_disable(tx_handle_);
+    gpio_set_level(pa_gpio_, 0);
+
+    /* Restore the assistant playback clock so normal TTS works after exit. */
+    i2s_std_clk_config_t clk = {
+        .sample_rate_hz = (uint32_t)output_sample_rate_,
+        .clk_src = I2S_CLK_SRC_DEFAULT,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_384,
+        #ifdef I2S_HW_VERSION_2
+            .ext_clk_freq_hz = 0,
+        #endif
+    };
+    i2s_channel_reconfig_std_clock(tx_handle_, &clk);
+
+    streaming_ = false;
+    stream_rate_ = 0;
+    stream_channels_ = 1;
+    output_enabled_ = false;
+    ESP_LOGI(TAG, "stream stopped");
 }
