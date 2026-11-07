@@ -222,6 +222,7 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     // 这里曾是 1，导致电台播放时 LVGL 被音频任务持续抢占，
     // 表现为整机卡顿、点按丢失（LVGL 读不到完整的按下/抬起样本）。
     port_cfg.task_priority = 5;
+    port_cfg.task_stack = 9216;  // 默认 7KB 在整屏渲染 + 事件/定时器叠加时偏紧，手电滑动偶发栈溢出
     port_cfg.timer_period_ms = 2;  // 与原厂 sdgoods_lvgl.c 对齐：LVGL tick 2ms（默认 5ms 动画显断）
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;

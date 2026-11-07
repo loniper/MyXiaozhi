@@ -86,6 +86,13 @@ public:
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
+    // 读取陀螺仪角速度（单位：度/秒）。没有该硬件的板子返回 false。
+    virtual bool ReadGyro(int& x, int& y, int& z) {
+        (void)x;
+        (void)y;
+        (void)z;
+        return false;
+    }
     virtual std::string GetSystemInfoJson();
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;

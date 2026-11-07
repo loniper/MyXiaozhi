@@ -722,6 +722,8 @@ private:
     SdgoodsRoundLcdDisplay* display_;
     AppHost app_host_;   // 应用框架：应用层 + 单应用生命周期（见 main/apps）
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
+    i2c_master_dev_handle_t imu_dev_ = nullptr;   // QMI8658（手电“摇一摇”用）
+    bool imu_ready_ = false;
     AdcBatteryMonitor* battery_monitor_ = nullptr;
 
     // 控制中心浮层（照抄原厂 sdgoods_cc.c 的 iOS 风格：满屏纯黑 + 圆形瓷砖 + 二级页）
@@ -875,6 +877,7 @@ private:
             i2c_bus_ = nullptr;
             ESP_LOGE(TAG, "I2C bus init failed, touch disabled");
         }
+        InitializeImu();
     }
 
     void InitializeTouch() {
@@ -923,6 +926,30 @@ private:
         };
         lvgl_port_add_touch(&touch_cfg);
         ESP_LOGI(TAG, "CST816S touch ready (I2C addr 0x%02X)", ESP_LCD_TOUCH_IO_I2C_CST816S_ADDRESS);
+    }
+
+    // ---------- QMI8658 六轴 IMU（与触摸共用 I2C1）：供手电的“摇一摇”使用 ----------
+    bool ImuWrite(uint8_t reg, uint8_t value) {
+        uint8_t buf[2] = {reg, value};
+        return i2c_master_transmit(imu_dev_, buf, sizeof(buf), 50) == ESP_OK;
+    }
+
+    void InitializeImu() {
+        if (i2c_bus_ == nullptr) {
+            return;
+        }
+        i2c_device_config_t dev_cfg = {};
+        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        dev_cfg.device_address = 0x6B;
+        dev_cfg.scl_speed_hz = 400 * 1000;
+        if (i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &imu_dev_) != ESP_OK) {
+            imu_dev_ = nullptr;
+            return;
+        }
+        // 与原厂 BSP 相同的初始化：地址自增；加速度 ±4g/250Hz；陀螺 ±64dps/250Hz；六轴使能
+        imu_ready_ = ImuWrite(0x02, 0x40) && ImuWrite(0x03, 0x15) &&
+                     ImuWrite(0x04, 0x25) && ImuWrite(0x08, 0x43);
+        ESP_LOGI(TAG, "QMI8658 IMU %s", imu_ready_ ? "ready" : "not found");
     }
 
     // 关机：熄屏 -> 释放电池自锁闩断电；USB 供电时落到深睡兑底（与原厂 sdgoods_power_off 同构）
@@ -1852,6 +1879,26 @@ public:
 
     virtual Display* GetDisplay() override {
         return display_;
+    }
+
+    // 陀螺仪角速度（度/秒，±64dps 量程）。IMU 不存在时返回 false。
+    virtual bool ReadGyro(int& x, int& y, int& z) override {
+        if (!imu_ready_ || imu_dev_ == nullptr) {
+            return false;
+        }
+        uint8_t reg = 0x3B;   // GX_L
+        uint8_t buf[6] = {0};
+        if (i2c_master_transmit_receive(imu_dev_, &reg, 1, buf, sizeof(buf), 50) != ESP_OK) {
+            return false;
+        }
+        const int16_t gx = static_cast<int16_t>((static_cast<uint16_t>(buf[1]) << 8) | buf[0]);
+        const int16_t gy = static_cast<int16_t>((static_cast<uint16_t>(buf[3]) << 8) | buf[2]);
+        const int16_t gz = static_cast<int16_t>((static_cast<uint16_t>(buf[5]) << 8) | buf[4]);
+        constexpr float kScale = 64.0f / 32768.0f;
+        x = static_cast<int>(gx * kScale);
+        y = static_cast<int>(gy * kScale);
+        z = static_cast<int>(gz * kScale);
+        return true;
     }
 
     virtual Backlight* GetBacklight() override {

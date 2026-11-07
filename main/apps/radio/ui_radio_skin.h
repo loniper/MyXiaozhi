@@ -20,8 +20,8 @@
 
 #include "ui_radio_kit.h"
 
-#define RADIO_SKIN_COUNT 13
-#define RADIO_SKIN_DEFAULT 1
+#define RADIO_SKIN_COUNT 1
+#define RADIO_SKIN_DEFAULT 0
 #define RADIO_SKIN_CLOCK_Y 28
 #define RADIO_SKIN_CLOCK_H 22
 #define RADIO_SKIN_STATUS_Y 52

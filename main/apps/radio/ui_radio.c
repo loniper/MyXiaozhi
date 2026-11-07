@@ -52,8 +52,7 @@ static char s_codec[RADIO_CODEC_MAX];
 static char s_clock[12] = "--:--";
 static int s_sleep_min;
 static uint32_t s_sleep_deadline, s_clock_ms, s_lang_seq;
-static bool s_overlay_open, s_swipe_owned, s_swipe_queued;
-static int s_swipe_direction;
+static bool s_overlay_open;
 static uint32_t s_style_error_until;
 static bool s_request_error;
 static wifi_prov_state_t s_network_prev;
@@ -61,113 +60,6 @@ static wifi_prov_state_t s_network_prev;
 static void refresh_ui(void);
 static void rebuild_ui(void);
 static bool ctl_set_skin(int skin);
-
-/* 换肤左右滑动。
- *
- * 不直接平移两个活页面：那样每帧都要重新绘制两套皮肤的装饰（点阵数字、
- * 波形、按钮图标、文字），帧时间太长，动画期间会出现「某块还没画完」的底纹。
- *
- * 现在先把新旧两页各截一张 360x360 位图，动画只移动这两张图。每帧绘制量从
- * 「整页重新排版」降到「两次整图搬运」，并且图画面上是两张完整的静态图，
- * 拖动过程中不会露出任何中间态。每帧整屏标脏 → 一次整帧 flush，配合
- * lcd_display 里「整帧写入前等 TE」，面板上永远只有一张完整帧。 */
-#define SKIN_SLIDE_MS 100
-static int s_skin_slide_dir;       /* 1=下一页从右侧进入，-1=上一页从左侧进入，0=无动效 */
-static lv_obj_t *s_slide_old;
-static lv_obj_t *s_slide_new;
-static lv_obj_t *s_slide_img[2];
-static lv_image_dsc_t s_slide_dsc[2];
-static lv_draw_buf_t *s_slide_snap[2];
-static int s_slide_dir;
-
-static void skin_slide_exec(void *obj, int32_t v)
-{
-    (void)obj;
-    if (s_slide_img[0] == NULL || s_slide_img[1] == NULL) return;
-    lv_obj_set_x(s_slide_img[0], -s_slide_dir * v);         /* 旧页快照滑出 */
-    lv_obj_set_x(s_slide_img[1], s_slide_dir * (360 - v));  /* 新页快照滑入 */
-}
-
-static void skin_slide_cleanup(void)
-{
-    for (int i = 0; i < 2; ++i) {
-        if (s_slide_img[i] != NULL) { lv_obj_del(s_slide_img[i]); s_slide_img[i] = NULL; }
-        if (s_slide_snap[i] != NULL) { lv_draw_buf_destroy(s_slide_snap[i]); s_slide_snap[i] = NULL; }
-    }
-    if (s_slide_new != NULL) {
-        lv_obj_clear_flag(s_slide_new, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_x(s_slide_new, 0);
-        s_slide_new = NULL;
-    }
-    if (s_slide_old != NULL) { lv_obj_del(s_slide_old); s_slide_old = NULL; }
-}
-
-static void skin_slide_done(lv_anim_t *a)
-{
-    (void)a;
-    skin_slide_cleanup();
-}
-
-/* 立即收尾：重复换肤 / 退出应用时调用，直接钉到终态。 */
-static void skin_slide_abort(void)
-{
-    lv_anim_delete(NULL, skin_slide_exec);
-    skin_slide_cleanup();
-}
-
-static void start_skin_slide(lv_obj_t *old, lv_obj_t *in, int dir)
-{
-    /* 截图失败（PSRAM 不够）就退化成瞬时切换，宁可不炫也不留残影 */
-    lv_draw_buf_t *so = lv_snapshot_take(old, LV_COLOR_FORMAT_RGB565);
-    lv_draw_buf_t *sn = lv_snapshot_take(in, LV_COLOR_FORMAT_RGB565);
-    s_slide_snap[0] = so;
-    s_slide_snap[1] = sn;
-    s_slide_old = old;
-    s_slide_new = in;
-    s_slide_dir = dir;
-
-    if (so == NULL || sn == NULL) {
-        skin_slide_cleanup();
-        return;
-    }
-
-    for (int i = 0; i < 2; ++i) {
-        lv_draw_buf_t *buf = s_slide_snap[i];
-        lv_image_dsc_t *d = &s_slide_dsc[i];
-        memset(d, 0, sizeof(*d));
-        d->header.magic = LV_IMAGE_HEADER_MAGIC;
-        d->header.cf = LV_COLOR_FORMAT_RGB565;
-        d->header.w = 360;
-        d->header.h = 360;
-        d->header.stride = (uint16_t)buf->header.stride;
-        d->data_size = buf->data_size;
-        d->data = buf->data;
-
-        lv_obj_t *img = lv_image_create(s_parent);
-        if (img == NULL) { skin_slide_cleanup(); return; }
-        lv_image_set_src(img, d);
-        lv_obj_set_pos(img, 0, 0);
-        lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
-        s_slide_img[i] = img;
-    }
-
-    /* 两张图已盖住整屏，真实页面先藏起来，动画结束再放出新页 */
-    lv_obj_add_flag(old, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(in, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_x(s_slide_img[0], 0);
-    lv_obj_set_x(s_slide_img[1], dir * 360);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_slide_img[0]);
-    lv_anim_set_values(&a, 0, 360);
-    lv_anim_set_duration(&a, SKIN_SLIDE_MS);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a, skin_slide_exec);
-    lv_anim_set_completed_cb(&a, skin_slide_done);
-    lv_anim_start(&a);
-}
 
 static const char *status_word(void)
 {
@@ -301,80 +193,11 @@ static void on_play(void *ud)
     refresh_ui();
 }
 
-/* 电台列表/设置页已按需求移除：进入即播，只有左右滑换皮肤与底部三键。 */
+/* 电台列表/设置页已按需求移除：进入即播，只有底部三键。 */
 static void on_settings(void *ud) { (void)ud; }
 static void on_list(void *ud) { (void)ud; }
 
-static void cycle_skin_async(void *arg)
-{
-    s_swipe_queued = false;
-    if (!s_scr || s_overlay_open || radio_pages_any_open()) return;
-    int direction = (int)(intptr_t)arg;
-    if (direction != 1 && direction != -1) return;
-    int next = (s_skin + direction + RADIO_SKIN_COUNT) % RADIO_SKIN_COUNT;
-    s_skin_slide_dir = direction;
-    if (!ctl_set_skin(next)) {
-        s_style_error_until = lv_tick_get() + 3000;
-        s_skin_slide_dir = 0;
-    }
-    refresh_ui();
-    /* 有滑动时交给动画逐帧刷新；无动效时同步画完整帧，避免 PARTIAL
-     * 分帧刷新留下上一套皮肤的底纹。 */
-    if (s_slide_new == NULL) lv_refr_now(NULL);
-}
-
-/* 手势：本工程 LVGL 9 未开启 LV_USE_GESTURE_RECOGNITION，LV_EVENT_GESTURE
- * 永远不会触发（上一版滑动失效的根因）。这里按 LVGL 8 的规则自己算位移：
- * 主屏任意位置（封面/文字/按钮）左右滑切换封面。列表页已移除，上滑不再响应。
- * 按钮事件带 EVENT_BUBBLE，会冒泡到这里；按下点在按钮上也一样能滑。 */
-static lv_point_t s_press_pt;
-static bool s_press_valid;
-
-static int swipe_direction_of(lv_event_t *e)
-{
-    lv_indev_t *indev = lv_event_get_indev(e);
-    if (!indev || !s_press_valid) return 0;
-    lv_point_t p;
-    lv_indev_get_point(indev, &p);
-    int dx = (int)p.x - (int)s_press_pt.x;
-    int dy = (int)p.y - (int)s_press_pt.y;
-    int adx = dx < 0 ? -dx : dx;
-    int ady = dy < 0 ? -dy : dy;
-    if (adx >= 55 && adx > ady) return dx < 0 ? 1 : -1;   /* 左滑下一张，右滑上一张 */
-    return 0;
-}
-
-static void skin_gesture(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_PRESSED) {
-        s_swipe_owned = !s_overlay_open && !radio_pages_any_open();
-        s_swipe_direction = 0;
-        s_press_valid = false;
-        lv_indev_t *indev = lv_event_get_indev(e);
-        if (indev) {
-            lv_indev_get_point(indev, &s_press_pt);
-            s_press_valid = true;
-        }
-    } else if (code == LV_EVENT_RELEASED) {
-        if (s_swipe_owned && !s_swipe_queued) {
-            s_swipe_direction = swipe_direction_of(e);
-            if (s_swipe_direction) {
-                s_swipe_queued = true;
-                lv_async_call(cycle_skin_async, (void *)(intptr_t)s_swipe_direction);
-            }
-        }
-        s_swipe_owned = false;
-        s_swipe_direction = 0;
-        s_press_valid = false;
-    } else if (code == LV_EVENT_PRESS_LOST) {
-        s_swipe_owned = false;
-        s_swipe_direction = 0;
-        s_press_valid = false;
-    }
-}
-
-static void overlay_open(void) { s_overlay_open = true; s_swipe_owned = false; }
+static void overlay_open(void) { s_overlay_open = true; }
 static void overlay_close(void) { s_overlay_open = false; }
 
 static void refresh_ui(void)
@@ -407,32 +230,19 @@ static void build_screen(void)
     lv_obj_set_size(s_scr, 360, 360);
     lv_obj_set_pos(s_scr, 0, 0);
     lv_obj_clear_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
-    /* 整屏可点击，LVGL 9 才会把触摸目标定为 s_scr；否则摸到艺术画/文字时
-     * 找不到可点击对象，滑动事件不会产生。 */
+    /* 整屏可点击：保证摸到空白处时触摸目标仍是本页，不会穿透到宿主。 */
     lv_obj_add_flag(s_scr, LV_OBJ_FLAG_CLICKABLE);
     const radio_skin_actions_t actions = {on_settings, on_list, on_prev, on_play, on_next};
     radio_skin_view_create(&s_view, s_scr, s_skin, &actions);
-    lv_obj_add_event_cb(s_scr, skin_gesture, LV_EVENT_ALL, NULL);
     refresh_ui();
 }
 
 static void rebuild_ui(void)
 {
     radio_pages_detach();
-    skin_slide_abort();
     lv_obj_t *old = s_scr;
-    int dir = s_skin_slide_dir;
-    s_skin_slide_dir = 0;
-
     build_screen();
-    if (!old) return;
-
-    if (dir == 0) {
-        /* 非滑动场景（切语言、回滚等）：直接替换 */
-        lv_obj_del(old);
-        return;
-    }
-    start_skin_slide(old, s_scr, dir);
+    if (old) lv_obj_del(old);
 }
 
 static void ctl_set_city(const char *city)
@@ -571,7 +381,6 @@ static void close_to_app(void)
 {
     if (!s_scr) return;
     radio_pages_detach();
-    skin_slide_abort();
     radio_player_stop();
     if (s_tick) { lv_timer_del(s_tick); s_tick = NULL; }
     lv_obj_t *old = s_scr;
@@ -623,7 +432,7 @@ void ui_radio_start(lv_obj_t *parent)
     radio_pages_init(&s_ctl);
     build_screen();
     sdgoods_app_shell_set_exit_cb(close_to_app);
-    s_overlay_open = s_swipe_owned = s_swipe_queued = false;
+    s_overlay_open = false;
     sdgoods_app_shell_set_pause_cb(overlay_open);
     sdgoods_app_shell_set_resume_cb(overlay_close);
     s_tick = lv_timer_create(radio_tick, 120, NULL);

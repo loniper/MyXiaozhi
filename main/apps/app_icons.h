@@ -8,5 +8,4 @@
 #include <lvgl.h>
 
 void DrawRadioIcon(lv_obj_t* parent, int x, int y);
-void DrawDeviceInfoIcon(lv_obj_t* parent, int x, int y);
-void DrawDemoIcon(lv_obj_t* parent, int x, int y);
+void DrawFlashlightIcon(lv_obj_t* parent, int x, int y);

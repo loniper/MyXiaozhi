@@ -3,20 +3,17 @@
 #include "app.h"
 
 extern const AppInfo kAppCenterInfo;
-extern const AppInfo kDemoInfo;
-extern const AppInfo kDeviceInfoInfo;
+extern const AppInfo kFlashlightInfo;
 extern const AppInfo kRadioInfo;
 
 App* CreateAppCenterApp();
-App* CreateDemoApp();
-App* CreateDeviceInfoApp();
+App* CreateFlashlightApp();
 App* CreateRadioApp();
 
 static const AppEntry kEntries[] = {
     {&kAppCenterInfo, CreateAppCenterApp},
     {&kRadioInfo, CreateRadioApp},
-    {&kDeviceInfoInfo, CreateDeviceInfoApp},
-    {&kDemoInfo, CreateDemoApp},
+    {&kFlashlightInfo, CreateFlashlightApp},
 };
 
 const AppEntry* GetAppRegistry(int* count) {

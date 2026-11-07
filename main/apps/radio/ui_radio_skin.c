@@ -30,19 +30,7 @@
 #include "radio_catalog.h"
 
 static const radio_skin_t s_skins[] = {
-    {"paper-radio", "纸感收音机", "Paper Radio", 0xF4EBDD, 0x242420, 0x716B60, 0xD6664D, 0xE5D8C4, RADIO_LAYOUT_PAPER, &radio_art_paper_scene},
     {"dot-matrix", "点阵电波", "Dot Matrix", 0x101112, 0xF1F0E8, 0xB0B2AA, 0xD44A34, 0x252829, RADIO_LAYOUT_DOTS, NULL},
-    {"pixel-host", "像素主播", "Pixel Host", 0xA98AFF, 0x201832, 0x38294D, 0x29363C, 0xBDA6FF, RADIO_LAYOUT_ART, &radio_art_host},
-    {"sound-field", "声波极简", "Sound Field", 0x0D1017, 0xF0F3F5, 0xB5BEC8, 0x54DBCD, 0x202735, RADIO_LAYOUT_WAVE, NULL},
-    {"cat-dj", "猫咪 DJ", "Cat DJ", 0xFFE8B8, 0x242631, 0x5B503D, 0xD24D39, 0xF4D89F, RADIO_LAYOUT_ART, &radio_art_cat},
-    {"space-signal", "太空电波", "Space Signal", 0x071C44, 0xF0F1FF, 0xB9CBE8, 0x93E8CB, 0x1B345D, RADIO_LAYOUT_ART, &radio_art_space},
-    {"seaside-sunset", "海边落日", "Seaside Sunset", 0x006675, 0xFFF0D0, 0xE4E8D3, 0xFFC588, 0x167684, RADIO_LAYOUT_ART, &radio_art_sea},
-    {"rainy-shop", "雨夜便利店", "Rainy Shop", 0x242448, 0xF1E7FF, 0xC8C4E4, 0xC4A9F2, 0x38385A, RADIO_LAYOUT_ART, &radio_art_rain},
-    {"pocket-player", "掌机音乐盒", "Pocket Player", 0xD7F0A0, 0x203B26, 0x475D39, 0x345B31, 0xC4DD8B, RADIO_LAYOUT_ART, &radio_art_robot},
-    {"garden-capybara", "像素花园", "Capybara Garden", 0xFFF29B, 0x29452C, 0x536443, 0x37613A, 0xE7DF8C, RADIO_LAYOUT_ART, &radio_art_garden},
-    {"vinyl-pixel", "薄荷像素唱机", "Pixel Deck", 0xD8F8E3, 0x092E25, 0x355A4B, 0xED896A, 0xC1E2D0, RADIO_LAYOUT_VINYL, &radio_art_vinyl_pixel},
-    {"vinyl-pop", "蓝橙唱片", "Pop Vinyl", 0xF9F5ED, 0x172230, 0x62645E, 0x164FEF, 0xEBE5DA, RADIO_LAYOUT_VINYL, &radio_art_vinyl_pop},
-    {"vinyl-night", "紫夜唱片", "Night Vinyl", 0x1A193F, 0xFFF2E2, 0xD8CDE6, 0xC48CF0, 0x302C53, RADIO_LAYOUT_VINYL, &radio_art_vinyl_night},
 };
 _Static_assert(sizeof(s_skins)/sizeof(s_skins[0])==RADIO_SKIN_COUNT, "skin registry count mismatch");
 
@@ -339,7 +327,7 @@ void radio_skin_view_create(radio_skin_view_t *v, lv_obj_t *parent, int index,
     lv_obj_set_style_bg_opa(parent,LV_OPA_COVER,0);
     v->clock=label(parent,130,RADIO_SKIN_CLOCK_Y,100,RADIO_SKIN_CLOCK_H,RK_FONT_BODY,s->ink,"--:--");
     v->status=label(parent,60,RADIO_SKIN_STATUS_Y,240,RADIO_SKIN_STATUS_H,RK_FONT_SMALL,s->ink,"");
-    v->live_dot=rk_box(parent,140,RADIO_SKIN_STATUS_Y+5,6,6);
+    v->live_dot=rk_box(parent,140,RADIO_SKIN_STATUS_Y+8,6,6);
     lv_obj_set_style_bg_color(v->live_dot,lv_color_hex(0xE1362D),0);
     lv_obj_set_style_bg_opa(v->live_dot,LV_OPA_COVER,0);
     if(s->art && s->layout!=RADIO_LAYOUT_PAPER){
@@ -425,8 +413,15 @@ void radio_skin_view_update(radio_skin_view_t *v, const char *name, const char *
     text_update(v->status,word);
     lv_point_t size;
     lv_txt_get_size(&size,word,RK_FONT_SMALL,0,0,240,LV_TEXT_FLAG_NONE);
-    lv_coord_t dot_x=180-size.x/2-12;
+    /* “红点 + 文字”要作为一整组居中。文字单独居中在 x=180 时，左侧红点会把
+     * 整组推左 6px；所以播放时把状态标签右移 6px，红点再按整组宽度左移，
+     * 整组中心才落在屏幕中线上。 */
+    lv_coord_t status_x=60+(show_live?6:0);
+    if(lv_obj_get_x(v->status)!=status_x)lv_obj_set_x(v->status,status_x);
+    lv_coord_t dot_x=174-size.x/2;
+    lv_coord_t dot_y=RADIO_SKIN_STATUS_Y+8;
     if(lv_obj_get_x(v->live_dot)!=dot_x)lv_obj_set_x(v->live_dot,dot_x);
+    if(lv_obj_get_y(v->live_dot)!=dot_y)lv_obj_set_y(v->live_dot,dot_y);
     if(show_live)lv_obj_clear_flag(v->live_dot,LV_OBJ_FLAG_HIDDEN);else lv_obj_add_flag(v->live_dot,LV_OBJ_FLAG_HIDDEN);
     text_update(v->clock,clock);
     bool fm=strncmp(frequency,"FM ",3)==0;

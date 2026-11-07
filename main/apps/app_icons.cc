@@ -8,8 +8,6 @@ constexpr uint32_t kAmber = 0xFFB45C;
 constexpr uint32_t kAmberDark = 0xE39A4F;
 constexpr uint32_t kCoral = 0xFF6B4A;
 constexpr uint32_t kKnob = 0x8A4A12;
-constexpr uint32_t kGreen = 0x35D07A;
-constexpr uint32_t kBlue = 0x6C8BFF;
 
 void DrawRect(lv_layer_t* layer, int ox, int oy, int x, int y, int w, int h, int radius,
               uint32_t color) {
@@ -36,18 +34,6 @@ void DrawLine(lv_layer_t* layer, int ox, int oy, int x1, int y1, int x2, int y2,
     lv_draw_line(layer, &dsc);
 }
 
-void DrawTriangle(lv_layer_t* layer, int ox, int oy, int x1, int y1, int x2, int y2, int x3,
-                  int y3, uint32_t color) {
-    lv_draw_triangle_dsc_t dsc;
-    lv_draw_triangle_dsc_init(&dsc);
-    dsc.color = lv_color_hex(color);
-    dsc.opa = LV_OPA_COVER;
-    dsc.p[0] = {static_cast<lv_value_precise_t>(ox + x1), static_cast<lv_value_precise_t>(oy + y1)};
-    dsc.p[1] = {static_cast<lv_value_precise_t>(ox + x2), static_cast<lv_value_precise_t>(oy + y2)};
-    dsc.p[2] = {static_cast<lv_value_precise_t>(ox + x3), static_cast<lv_value_precise_t>(oy + y3)};
-    lv_draw_triangle(layer, &dsc);
-}
-
 void DrawRadio(lv_layer_t* layer, int ox, int oy) {
     // Antenna first so the body covers its lower end.
     DrawLine(layer, ox, oy, 58, 24, 68, 11, kCream, 3);
@@ -63,15 +49,21 @@ void DrawRadio(lv_layer_t* layer, int ox, int oy) {
     DrawRect(layer, ox, oy, 18, 58, 44, 2, 1, kAmberDark);
 }
 
-void DrawDeviceInfo(lv_layer_t* layer, int ox, int oy) {
-    DrawRect(layer, ox, oy, 12, 12, 56, 56, LV_RADIUS_CIRCLE, kGreen);
-    DrawRect(layer, ox, oy, 36, 25, 8, 8, LV_RADIUS_CIRCLE, kCream);
-    DrawRect(layer, ox, oy, 37, 35, 6, 17, 3, kCream);
-}
-
-void DrawDemo(lv_layer_t* layer, int ox, int oy) {
-    DrawRect(layer, ox, oy, 12, 12, 56, 56, LV_RADIUS_CIRCLE, kBlue);
-    DrawTriangle(layer, ox, oy, 33, 24, 33, 56, 56, 40, kCream);
+void DrawFlashlight(lv_layer_t* layer, int ox, int oy) {
+    // 灯头射出的三道光束
+    DrawLine(layer, ox, oy, 34, 20, 26, 9, kCream, 3);
+    DrawLine(layer, ox, oy, 40, 18, 40, 6, kCream, 3);
+    DrawLine(layer, ox, oy, 46, 20, 54, 9, kCream, 3);
+    // 灯头与灯珠
+    DrawRect(layer, ox, oy, 27, 20, 26, 12, 4, kCream);
+    DrawRect(layer, ox, oy, 32, 22, 16, 8, 3, kCoral);
+    // 筒身与防滑纹
+    DrawRect(layer, ox, oy, 31, 32, 18, 34, 6, kAmber);
+    for (int y = 40; y <= 56; y += 6) {
+        DrawLine(layer, ox, oy, 35, y, 45, y, kAmberDark, 2);
+    }
+    // 开关
+    DrawRect(layer, ox, oy, 35, 35, 10, 3, 1, kKnob);
 }
 
 void OnDraw(lv_event_t* e) {
@@ -84,11 +76,8 @@ void OnDraw(lv_event_t* e) {
         case 0:
             DrawRadio(layer, coords.x1, coords.y1);
             break;
-        case 1:
-            DrawDeviceInfo(layer, coords.x1, coords.y1);
-            break;
         default:
-            DrawDemo(layer, coords.x1, coords.y1);
+            DrawFlashlight(layer, coords.x1, coords.y1);
             break;
     }
 }
@@ -108,6 +97,4 @@ void MakeIcon(lv_obj_t* parent, int x, int y, int kind) {
 
 void DrawRadioIcon(lv_obj_t* parent, int x, int y) { MakeIcon(parent, x, y, 0); }
 
-void DrawDeviceInfoIcon(lv_obj_t* parent, int x, int y) { MakeIcon(parent, x, y, 1); }
-
-void DrawDemoIcon(lv_obj_t* parent, int x, int y) { MakeIcon(parent, x, y, 2); }
+void DrawFlashlightIcon(lv_obj_t* parent, int x, int y) { MakeIcon(parent, x, y, 1); }
