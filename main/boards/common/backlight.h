@@ -14,6 +14,9 @@ public:
 
     void RestoreBrightness();
     void SetBrightness(uint8_t brightness, bool permanent = false);
+    // 立即生效，不走 5ms/档 的渐变。呼吸灯要每 40ms 改一次亮度，用渐变会一直追不上
+    // 目标值；整屏写入前遮挡撕裂也需要「立刻灭/立刻亮」。
+    void SetBrightnessImmediate(uint8_t brightness);
     inline uint8_t brightness() const { return brightness_; }
 
 protected:

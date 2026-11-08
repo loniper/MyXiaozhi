@@ -7,6 +7,7 @@
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
 #include <esp_memory_utils.h>
@@ -103,12 +104,6 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     esp_timer_create(&preview_timer_args, &preview_timer_);
 }
 
-static bool (*s_flush_sync_hook)(uint32_t timeout_ms) = nullptr;
-
-void SpiLcdDisplay::SetFlushSyncHook(bool (*fn)(uint32_t timeout_ms)) {
-    s_flush_sync_hook = fn;
-}
-
 static void sdgoods_spi_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *px_map) {
     esp_lcd_panel_handle_t panel = static_cast<esp_lcd_panel_handle_t>(lv_display_get_user_data(drv));
     const uint32_t px = lv_area_get_size(area);
@@ -133,15 +128,23 @@ static void sdgoods_spi_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8
 
     // 不再在这里做 lv_draw_sw_rgb565_swap：显示格式已经设成 RGB565_SWAPPED，
     // LVGL 渲染时直接按大端写入，逐像素交换在绘制阶段就完成了。
-    // esp_lcd_panel_draw_bitmap 内部把分块事务排进 DMA 队列；传输完成由 panel IO 的
-    // on_color_trans_done 回调 lv_display_flush_ready。所以这里返回并不代表已上屏。
-    // 参考工程遇到「内部 DMA 弹跳缓冲暂满」（ESP_ERR_NO_MEM）会稍等再重试，而不是直接
-    // 丢帧 —— 丢这一整帧正是黑带/残留的直接来源之一。
+    //
+    // flush_ready 必须在本函数里同步给 LVGL，不能只依赖 panel IO 的 on_color_trans_done：
+    // 1) 该回调运行在 SPI ISR 里，而本工程开了 CONFIG_SPI_MASTER_ISR_IN_IRAM，
+    //    ISR 里再调 flash 里的 lvgl_port 回调属于隐性依赖；
+    // 2) 双缓冲模式下 LVGL 在 lv_refr.c 的 wait_for_flushing() 里是 `while(disp->flushing);`
+    //    忙等，一旦完成回调漏掉一次，LVGL 线程就永久卡死（表现为死机）。
+    // esp_lcd_panel_draw_bitmap 返回时所有分块都已排进 DMA（内部弹跳缓冲已拷好数据），
+    // 所以此刻通知 LVGL 释放缓冲是安全的；下一帧的 draw_bitmap 会在 acquire_bus 处
+    // 自然等上一帧传完，不需要额外的同步。参考工程 sdgoods_lvgl.c 也是这个做法。
     esp_err_t err = ESP_FAIL;
     for (int i = 0; i < 12; ++i) {
         err = esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1,
                                         area->y2 + 1, px_map);
-        if (err == ESP_OK) return;   /* 提交成功：DMA 完成回调会调 flush_ready */
+        if (err == ESP_OK) {
+            lv_display_flush_ready(drv);
+            return;
+        }
         if (err == ESP_ERR_NO_MEM) {
             vTaskDelay(pdMS_TO_TICKS(5));   /* 队列/描述符暂满，让 DMA 跑完腾资源再试 */
             continue;
@@ -222,7 +225,9 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     // 这里曾是 1，导致电台播放时 LVGL 被音频任务持续抢占，
     // 表现为整机卡顿、点按丢失（LVGL 读不到完整的按下/抬起样本）。
     port_cfg.task_priority = 5;
-    port_cfg.task_stack = 9216;  // 默认 7KB 在整屏渲染 + 事件/定时器叠加时偏紧，手电滑动偶发栈溢出
+    // 手电整屏纯色页左右滑：整屏重绘 + 触摸事件 + 定时器调用栈叠加，9KB 仍会偶发
+    // 栈溢出（canary 命中 -> panic 重启；未命中 -> 破坏相邻内存 -> 卡死）。
+    port_cfg.task_stack = 16384;
     port_cfg.timer_period_ms = 2;  // 与原厂 sdgoods_lvgl.c 对齐：LVGL tick 2ms（默认 5ms 动画显断）
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
@@ -305,6 +310,11 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     lv_display_set_color_format(display_, LV_COLOR_FORMAT_RGB565_SWAPPED);
     lv_display_set_user_data(display_, panel_);
     lv_display_set_flush_cb(display_, sdgoods_spi_flush_cb);
+    // lvgl_port 会把 on_color_trans_done 注册成 lv_display_flush_ready。我们改由
+    // sdgoods_spi_flush_cb 同步通知，这里把该回调清掉，否则同一帧会被通知两次
+    // （第二次可能在下一帧渲染中途把 flushing 清掉，导致双缓冲错位）。
+    const esp_lcd_panel_io_callbacks_t no_io_cbs = {};
+    esp_lcd_panel_io_register_event_callbacks(panel_io_, &no_io_cbs, nullptr);
     if (offset_x != 0 || offset_y != 0) {
         lv_display_set_offset(display_, offset_x, offset_y);
     }

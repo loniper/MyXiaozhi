@@ -62,11 +62,6 @@ public:
     SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
                   int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y,
                   bool swap_xy, bool fullscreen_psram_buf = false);
-
-    // 可选的板级「帧同步」钩子：每次整屏 flush 前调用，板级可在这里等待面板 TE
-    // (V-blank) 起始沿，把 GRAM 写入对齐到面板扫描起点，消除整屏写入过程中的撕裂。
-    // 返回 false 表示面板没有 TE 信号，驱动照常立即写入。
-    static void SetFlushSyncHook(bool (*fn)(uint32_t timeout_ms));
 };
 
 // RGB LCD display

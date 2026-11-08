@@ -653,68 +653,13 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_sdgoods[] = {
     {0xF0, (uint8_t []){0x00}, 1, 0},
     {0x21, (uint8_t []){0x00}, 1, 0},
     {0x11, (uint8_t []){0x00}, 1, 120},
-    /* TEON：打开面板 TE(V-blank) 输出，配合 GPIO18 做帧同步。
-     * 参数 0x00 = 仅 V-blank 期间输出高电平脉冲，正好是「一帧开始扫描」的时刻。 */
+    /* TEON：参数 0x00 = 仅 V-blank 期间输出脉冲。
+     * 保留这条厂商初始化命令，但本机 GPIO18 上没有测到 TE 信号（参考工程
+     * sdgoods_lvgl.c 也注明「面板没有 VSYNC/TE 门控」），所以刷新无法与面板扫描
+     * 对齐；整屏跳变的撕裂改用背光遮盖写入窗口来消除，见 lcd_display.cc。 */
     {0x35, (uint8_t []){0x00}, 1, 0},
     {0x29, (uint8_t []){0x00}, 1, 0},
 };
-
-// ===== 面板 TE（帧起始）帧同步 =====
-// 换肤整屏滑动时，一帧 259200B 的 GRAM 写入要 6~7ms，而面板扫描一帧 16.7ms。
-// 如果写入起点是随机的，写入就会跨过扫描线，屏上出现「半帧旧 + 半帧新」的撕裂，
-// 在手机卷帘快门里就表现为斜着的像素块。把写入起点对齐到 TE 上升沿（V-blank）后，
-// 写入前沿始终领先扫描前沿，撕裂消失。
-// TE 是可选信号：上电探测不到（GPIO 一直是低电平）就自动放弃等待，行为与之前完全一致。
-static SemaphoreHandle_t s_te_sem = nullptr;
-static volatile bool s_te_ready = false;
-
-static void IRAM_ATTR sdgoods_te_isr(void*) {
-    BaseType_t woken = pdFALSE;
-    if (s_te_sem != nullptr) {
-        xSemaphoreGiveFromISR(s_te_sem, &woken);
-    }
-    if (woken == pdTRUE) {
-        portYIELD_FROM_ISR();
-    }
-}
-
-static bool sdgoods_te_wait(uint32_t timeout_ms) {
-    if (!s_te_ready || s_te_sem == nullptr) {
-        return false;
-    }
-    // 丢弃上一帧残留的计数，确保等的是「下一个」帧起点
-    xSemaphoreTake(s_te_sem, 0);
-    return xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
-}
-
-static void sdgoods_te_init() {
-    s_te_sem = xSemaphoreCreateBinary();
-    if (s_te_sem == nullptr) {
-        return;
-    }
-    gpio_config_t cfg = {};
-    cfg.pin_bit_mask = 1ULL << QSPI_PIN_NUM_LCD_TE;
-    cfg.mode = GPIO_MODE_INPUT;
-    cfg.pull_up_en = GPIO_PULLUP_DISABLE;
-    cfg.pull_down_en = GPIO_PULLDOWN_ENABLE;  // 未引出时保持低电平，探测安全
-    cfg.intr_type = GPIO_INTR_POSEDGE;
-    gpio_config(&cfg);
-
-    esp_err_t err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "gpio isr service: %s", esp_err_to_name(err));
-        return;
-    }
-    gpio_isr_handler_add(QSPI_PIN_NUM_LCD_TE, sdgoods_te_isr, nullptr);
-
-    if (xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(150)) == pdTRUE) {
-        s_te_ready = true;
-        SpiLcdDisplay::SetFlushSyncHook(sdgoods_te_wait);
-        ESP_LOGI(TAG, "Panel TE detected on GPIO%d, flush synced to frame start", QSPI_PIN_NUM_LCD_TE);
-    } else {
-        ESP_LOGW(TAG, "Panel TE not detected on GPIO%d, flush stays free-running", QSPI_PIN_NUM_LCD_TE);
-    }
-}
 
 class SdgoodsDimensionScreen : public WifiBoard {
 private:
@@ -822,9 +767,6 @@ private:
         esp_lcd_panel_disp_on_off(panel, true);
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-
-        // TEON 已在初始化表里打开；这里探测 TE 信号是否存在并接管 flush 帧同步
-        sdgoods_te_init();
 
         // 面板一开就先把 GRAM 刷成近黑：上电后到 LVGL 首次整屏刷新之间有几秒，
         // 期间屏上会留着厂方开机画面（蓝色渐变 + 小机器人）。这里用 DMA 条带

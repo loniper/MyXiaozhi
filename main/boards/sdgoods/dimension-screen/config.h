@@ -54,8 +54,10 @@
 #define QSPI_PIN_NUM_LCD_DATA2  GPIO_NUM_42
 #define QSPI_PIN_NUM_LCD_DATA3  GPIO_NUM_41
 #define QSPI_PIN_NUM_LCD_RST    DISPLAY_RST_GPIO
-// 面板 TE（帧起始）输出，来自参考 BSP board_pins.h: BOARD_LCD_SPI_IO_TE = 18。
-// 用来把整屏 GRAM 写入对齐到面板扫描起点，消除换肤整屏滑动时的撕裂/斜向错位。
+// 面板 TE（帧起始）引脚，来自参考 BSP board_pins.h: BOARD_LCD_SPI_IO_TE = 18。
+// ⚠️ 实测本机该脚没有 TE 脉冲（参考工程 sdgoods_lvgl.c 亦注明「面板没有 VSYNC/TE
+// 门控」），因此不能靠它做帧同步；整屏跳变的撕裂改由背光遮盖写入窗口消除。
+// 仅保留定义与厂商 board_pins.h 对齐，不要再用它做 flush 同步。
 #define QSPI_PIN_NUM_LCD_TE     GPIO_NUM_18
 
 #define DISPLAY_SPI_PCLK_HZ   (80 * 1000 * 1000)
