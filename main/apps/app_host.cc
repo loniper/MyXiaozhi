@@ -161,6 +161,14 @@ void AppHost::DoExit() {
         return;
     }
     app_->OnExit();
+    // 兜底保护：应用可能把事件回调直接挂在 layer_（应用层对象本身）上，而
+    // lv_obj_clean() 只删子对象、摘不掉对象自身的回调。若应用在 OnExit 里漏了
+    // lv_obj_remove_event_cb，下面 delete 之后这些回调的 user_data 就成了野指针，
+    // 下一个应用一触摸就会跳进已析构的对象 —— 这里统一摘掉所有 user_data 指向
+    // 本实例的回调，避免任何一个应用漏摘就把整机带崩。
+    if (layer_ != nullptr) {
+        lv_obj_remove_event_cb_with_user_data(layer_, nullptr, app_);
+    }
     delete app_;
     app_ = nullptr;
     delete ctx_;

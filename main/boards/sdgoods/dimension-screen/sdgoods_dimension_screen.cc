@@ -981,6 +981,34 @@ private:
             }
             app.ToggleChatState();
         });
+        // 双击：仅在小智待机（Idle）桌面生效 → 进入应用中心。
+        // 触发条件刻意收得很窄，保证不影响任何既有行为：
+        //   - 只在 kDeviceStateIdle 响应（启动/配网/连接/对话中全部忽略）；
+        //   - 应用内忽略（应用内单击仍是返回桌面）；
+        //   - 控制中心浮层打开时忽略（不去抢它的页面栈）；
+        //   - 熄屏待机页在最上层，先唤醒再进应用中心，否则应用会开在熄屏页后面。
+        // 单击/长按的语义完全不变：iot_button 判定为双击时只发 BUTTON_DOUBLE_CLICK，
+        // 不会再发 BUTTON_SINGLE_CLICK（双击窗口由 short_press_time 决定）。
+        boot_button_.OnDoubleClick([this]() {
+            if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+                return;
+            }
+            Application::GetInstance().Schedule([this]() {
+                if (display_ == nullptr) {
+                    return;
+                }
+                DisplayLockGuard lock(display_);
+                if (app_host_.IsActive() || cc_page_ != nullptr || cc_set_page_ != nullptr ||
+                    cc_slider_page_ != nullptr) {
+                    return;
+                }
+                if (cc_dim_page_ != nullptr) {
+                    ScreenWake();
+                }
+                LaunchAppLocked("app_center");
+                ESP_LOGI(TAG, "double click -> app center");
+            });
+        });
         // 长按 ≥1.5s：释放自锁闩关机（LONG_PRESS_START 触发一次，无需等松手）
         boot_button_.OnLongPress([this]() {
             PowerOff();

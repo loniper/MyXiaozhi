@@ -92,6 +92,20 @@ public:
     }
 
     void OnExit() override {
+        // 这几个回调是挂在 root_ 上的，而 root_ 是 AppHost 复用的应用层对象本身
+        // （不是它的子对象）。lv_obj_clean() 只删子对象，删不掉挂在对象身上的回调；
+        // 而 AppHost 紧接着会 delete 掉本 AppCenterApp 实例。不在这里主动摘掉，
+        // 这些回调就变成指向已释放内存的野指针 —— 下一个应用（手电/电台）触摸屏幕时
+        // 触发同一个 layer 的 PRESSED/RELEASED，就会跳进已经析构的 AppCenterApp，
+        // 读写野指针，表现为「从应用中心进手电后一碰就死机」。多次进出还会不断叠加。
+        if (root_ != nullptr) {
+            lv_obj_remove_event_cb(root_, OnPressed);
+            lv_obj_remove_event_cb(root_, OnPressing);
+            lv_obj_remove_event_cb(root_, OnReleased);
+            // 事件冒泡标志同样要还原：它是本应用加上去的，留着会让后续应用的
+            // 触摸事件继续往上层桌面冒泡。
+            lv_obj_remove_flag(root_, LV_OBJ_FLAG_EVENT_BUBBLE);
+        }
         if (pages_host_ != nullptr) {
             lv_anim_delete(pages_host_, nullptr);
         }
